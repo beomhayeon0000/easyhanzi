@@ -43,15 +43,17 @@ export default function AuthPanel({ onAuthChange }) {
       });
   }, [session]);
 
-  const submit = async (e) => {
-    e.preventDefault();
-    setError("");
-    setLoading(true);
-    const fn = mode === "login" ? supabase.auth.signInWithPassword : supabase.auth.signUp;
-    const { error } = await fn({ email, password });
-    setLoading(false);
-    if (error) setError(error.message);
-  };
+const submit = async (e) => {
+  e.preventDefault();
+  setError("");
+  setLoading(true);
+  const { error } =
+    mode === "login"
+      ? await supabase.auth.signInWithPassword({ email, password })
+      : await supabase.auth.signUp({ email, password });
+  setLoading(false);
+  if (error) setError(error.message);
+};
 
   const logout = async () => {
     await supabase.auth.signOut();
