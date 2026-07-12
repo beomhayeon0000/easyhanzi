@@ -8612,41 +8612,8 @@ function loadYouTubeIframeAPI() {
   return ytApiPromise;
 }
 
-// Whisper (transformers.js) chỉ được tải khi người dùng thật sự bấm "Tạo phụ đề
-// bằng AI" — thư viện khá nặng (mô hình ~150MB) nên không tải trước, tránh làm
-// chậm app cho những người không dùng tới tính năng này.
-let whisperPipelinePromise = null;
-async function importTransformersWithRetry(maxAttempts = 3) {
-  let lastErr;
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      return await import("@xenova/transformers");
-    } catch (e) {
-      lastErr = e;
-      // Chờ một chút rồi thử lại — lỗi "Failed to fetch dynamically imported module"
-      // thường chỉ là mạng bị ngắt giữa chừng khi tải file lớn, thử lại là qua.
-      await new Promise((r) => setTimeout(r, 800 * (i + 1)));
-    }
-  }
-  throw lastErr;
-}
-
-async function loadWhisperPipeline(onProgress) {
-  if (whisperPipelinePromise) return whisperPipelinePromise;
-  whisperPipelinePromise = (async () => {
-    try {
-      const { pipeline } = await importTransformersWithRetry();
-      return await pipeline("automatic-speech-recognition", "Xenova/whisper-base", {
-        progress_callback: onProgress,
-      });
-    } catch (e) {
-      // Cho phép lần bấm nút tiếp theo được thử tải lại từ đầu thay vì kẹt lỗi mãi mãi
-      whisperPipelinePromise = null;
-      throw new Error("Không tải được thư viện AI — có thể do mạng bị ngắt. Hãy tải lại trang (Ctrl+F5) rồi thử lại.");
-    }
-  })();
-  return whisperPipelinePromise;
-}
+// Whisper (transformers.js) giờ chạy trong Web Worker riêng (xem src/whisperWorker.js)
+// để không làm đơ giao diện chính khi AI đang tính toán.
 
 // Whisper cần audio dạng mono 16kHz Float32Array — dùng Web Audio API để giải mã
 // và hạ tần số lấy mẫu đúng chuẩn. Dùng chung cho cả 2 nguồn: tải từ URL (qua
@@ -8701,6 +8668,23 @@ function SubtitleView() {
   const playerRef = useRef(null);
   const playerDivId = useRef("yt-player-" + Math.random().toString(36).slice(2));
   const rafRef = useRef(null);
+  const workerRef = useRef(null);
+
+  const getWorker = () => {
+    if (!workerRef.current) {
+      workerRef.current = new Worker(new URL("./whisperWorker.js", import.meta.url), { type: "module" });
+    }
+    return workerRef.current;
+  };
+
+  useEffect(() => {
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+    };
+  }, []);
 
   const fetchCC = async (id) => {
     setLoadState("loading");
@@ -8736,25 +8720,40 @@ function SubtitleView() {
 
   // Dùng chung cho cả 2 nguồn âm thanh (link YouTube qua server, hoặc file tự chọn
   // trên máy) — phần chạy AI transcribe giống hệt nhau, chỉ khác cách lấy audioData.
+  // Việc tính toán AI thực sự diễn ra trong Web Worker (whisperWorker.js) để
+  // không làm đơ giao diện chính trong lúc xử lý.
   const runTranscription = async (getAudioData) => {
     setAiState("downloading-model");
-    setAiProgress("Đang tải mô hình AI (khoảng 150MB, chỉ cần tải 1 lần)...");
+    setAiProgress("Đang tải âm thanh...");
     try {
-      const transcriber = await loadWhisperPipeline((p) => {
-        if (p.status === "progress") {
-          setAiProgress(`Đang tải mô hình AI... ${Math.round(p.progress || 0)}%`);
-        }
-      });
-      setAiState("transcribing");
       const audioData = await getAudioData();
-      setAiProgress("AI đang nghe và tạo phụ đề — video/audio càng dài càng lâu, vui lòng chờ...");
-      const output = await transcriber(audioData, {
-        language: "chinese",
-        task: "transcribe",
-        return_timestamps: true,
-        chunk_length_s: 30,
-        stride_length_s: 5,
+      setAiState("transcribing");
+      setAiProgress("Đang tải mô hình AI (khoảng 150MB, chỉ cần tải 1 lần)...");
+
+      const output = await new Promise((resolve, reject) => {
+        const worker = getWorker();
+        const handleMessage = (e) => {
+          const { type, payload } = e.data || {};
+          if (type === "progress") {
+            if (payload && payload.status === "progress") {
+              setAiProgress(`Đang tải mô hình AI... ${Math.round(payload.progress || 0)}%`);
+            }
+          } else if (type === "status" && payload === "transcribing") {
+            setAiProgress("AI đang nghe và tạo phụ đề (chạy nền, trang vẫn dùng được bình thường)...");
+          } else if (type === "done") {
+            worker.removeEventListener("message", handleMessage);
+            resolve(payload);
+          } else if (type === "error") {
+            worker.removeEventListener("message", handleMessage);
+            reject(new Error(payload || "Lỗi không rõ khi chạy AI."));
+          }
+        };
+        worker.addEventListener("message", handleMessage);
+        // Chuyển quyền sở hữu buffer cho worker (transferable) thay vì sao chép,
+        // nhanh và nhẹ bộ nhớ hơn với audio dài.
+        worker.postMessage({ type: "transcribe", audioData }, [audioData.buffer]);
       });
+
       const chunks = output && output.chunks ? output.chunks : [];
       const newCues = chunks
         .filter((c) => c.text && c.text.trim())
