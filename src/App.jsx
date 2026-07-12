@@ -8649,7 +8649,22 @@ async function loadWhisperPipeline(onProgress) {
 }
 
 // Whisper cần audio dạng mono 16kHz Float32Array — dùng Web Audio API để giải mã
-// và hạ tần số lấy mẫu đúng chuẩn.
+// và hạ tần số lấy mẫu đúng chuẩn. Dùng chung cho cả 2 nguồn: tải từ URL (qua
+// server) hoặc từ file người dùng tự chọn trên máy (không qua server).
+async function decodeArrayBufferToWhisperInput(buf) {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const audioCtx = new AudioCtx();
+  const decoded = await audioCtx.decodeAudioData(buf);
+  const targetRate = 16000;
+  const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * targetRate), targetRate);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  return rendered.getChannelData(0);
+}
+
 async function decodeAudioFromUrl(url) {
   const res = await fetch(url);
   if (!res.ok) {
@@ -8663,17 +8678,14 @@ async function decodeAudioFromUrl(url) {
     throw new Error("Không tải được âm thanh — " + detail);
   }
   const buf = await res.arrayBuffer();
-  const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  const audioCtx = new AudioCtx();
-  const decoded = await audioCtx.decodeAudioData(buf);
-  const targetRate = 16000;
-  const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * targetRate), targetRate);
-  const src = offline.createBufferSource();
-  src.buffer = decoded;
-  src.connect(offline.destination);
-  src.start();
-  const rendered = await offline.startRendering();
-  return rendered.getChannelData(0);
+  return decodeArrayBufferToWhisperInput(buf);
+}
+
+// Đọc file âm thanh/video do người dùng tự chọn trên máy — hoàn toàn không qua
+// server, không đụng tới YouTube nên KHÔNG BAO GIỜ bị chặn bot.
+async function decodeAudioFromFile(file) {
+  const buf = await file.arrayBuffer();
+  return decodeArrayBufferToWhisperInput(buf);
 }
 
 function SubtitleView() {
@@ -8722,8 +8734,9 @@ function SubtitleView() {
     fetchCC(id);
   };
 
-  const generateWithAI = async () => {
-    if (!videoId) return;
+  // Dùng chung cho cả 2 nguồn âm thanh (link YouTube qua server, hoặc file tự chọn
+  // trên máy) — phần chạy AI transcribe giống hệt nhau, chỉ khác cách lấy audioData.
+  const runTranscription = async (getAudioData) => {
     setAiState("downloading-model");
     setAiProgress("Đang tải mô hình AI (khoảng 150MB, chỉ cần tải 1 lần)...");
     try {
@@ -8733,9 +8746,8 @@ function SubtitleView() {
         }
       });
       setAiState("transcribing");
-      setAiProgress("Đang tải âm thanh từ video...");
-      const audioData = await decodeAudioFromUrl(`/api/audio-proxy?videoId=${videoId}`);
-      setAiProgress("AI đang nghe và tạo phụ đề — video càng dài càng lâu, vui lòng chờ...");
+      const audioData = await getAudioData();
+      setAiProgress("AI đang nghe và tạo phụ đề — video/audio càng dài càng lâu, vui lòng chờ...");
       const output = await transcriber(audioData, {
         language: "chinese",
         task: "transcribe",
@@ -8751,14 +8763,29 @@ function SubtitleView() {
           end: (c.timestamp && c.timestamp[1]) || ((c.timestamp && c.timestamp[0]) || 0) + 3,
           text: c.text.trim(),
         }));
-      if (!newCues.length) throw new Error("AI không nhận ra lời thoại tiếng Trung nào trong video này.");
+      if (!newCues.length) throw new Error("AI không nhận ra lời thoại tiếng Trung nào.");
       setCues(newCues);
       setLoadState("ready");
       setAiState("idle");
     } catch (e) {
       setAiState("error");
-      setAiProgress((e && e.message) || "Có lỗi khi tạo phụ đề bằng AI, thử lại hoặc dùng video khác.");
+      setAiProgress((e && e.message) || "Có lỗi khi tạo phụ đề bằng AI, thử lại hoặc dùng cách khác.");
     }
+  };
+
+  const generateWithAI = () => {
+    if (!videoId) return;
+    setAiProgress("Đang tải âm thanh từ video...");
+    runTranscription(() => decodeAudioFromUrl(`/api/audio-proxy?videoId=${videoId}`));
+  };
+
+  // Tải file âm thanh/video từ máy người dùng — không đụng tới YouTube hay server
+  // nào cả, nên KHÔNG BAO GIỜ bị chặn bot. Đây là cách chắc chắn nhất khi cách lấy
+  // audio tự động từ link YouTube bị chặn.
+  const generateWithAIFromFile = (file) => {
+    if (!file) return;
+    setAiProgress(`Đang đọc file "${file.name}"...`);
+    runTranscription(() => decodeAudioFromFile(file));
   };
 
   useEffect(() => {
@@ -8876,11 +8903,49 @@ function SubtitleView() {
               margin: "0 auto",
             }}
           >
-            🤖 Tạo phụ đề bằng AI (miễn phí, chạy ngay trên máy bạn)
+            🤖 Tạo phụ đề bằng AI từ link YouTube
           </button>
           <div style={{ fontSize: 11, color: "#B0A488", marginTop: 6, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
-            Lần đầu cần tải mô hình AI (~150MB) và có thể mất vài phút tùy độ dài video, cấu hình máy và tốc độ
-            mạng. Nên dùng cho video ngắn (dưới 5 phút), trên máy tính hoặc điện thoại đời mới sẽ mượt hơn.
+            Cách này đôi khi bị YouTube chặn (không phải lỗi của bạn). Nếu báo lỗi, dùng cách chắc chắn hơn bên
+            dưới.
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "16px auto", maxWidth: 300 }}>
+            <div style={{ flex: 1, height: 1, background: "#D8CCAE" }} />
+            <span style={{ fontSize: 11, color: "#B0A488" }}>hoặc</span>
+            <div style={{ flex: 1, height: 1, background: "#D8CCAE" }} />
+          </div>
+
+          <label
+            style={{
+              ...btnGhost,
+              display: "inline-flex",
+              margin: "0 auto",
+              cursor: aiState === "downloading-model" || aiState === "transcribing" ? "default" : "pointer",
+              opacity: aiState === "downloading-model" || aiState === "transcribing" ? 0.6 : 1,
+            }}
+          >
+            📁 Tải lên file âm thanh/video từ máy
+            <input
+              type="file"
+              accept="audio/*,video/*"
+              disabled={aiState === "downloading-model" || aiState === "transcribing"}
+              onChange={(e) => {
+                const file = e.target.files && e.target.files[0];
+                if (file) generateWithAIFromFile(file);
+                e.target.value = "";
+              }}
+              style={{ display: "none" }}
+            />
+          </label>
+          <div style={{ fontSize: 11, color: "#B0A488", marginTop: 6, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
+            Tải video/âm thanh về máy trước (ví dụ bằng phần mềm tải video bạn quen dùng), rồi chọn file đó ở đây —
+            cách này xử lý hoàn toàn trên máy bạn, không qua YouTube nên không bao giờ bị chặn.
+          </div>
+
+          <div style={{ fontSize: 11, color: "#B0A488", marginTop: 10, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
+            Lần đầu dùng AI cần tải mô hình (~150MB), có thể mất vài phút tùy độ dài audio, cấu hình máy và tốc độ
+            mạng. Nên dùng file/video ngắn (dưới 5 phút); máy tính hoặc điện thoại đời mới sẽ mượt hơn.
           </div>
           {(aiState === "downloading-model" || aiState === "transcribing") && (
             <div style={{ fontSize: 12, color: "#4C7A6D", marginTop: 10 }}>{aiProgress}</div>

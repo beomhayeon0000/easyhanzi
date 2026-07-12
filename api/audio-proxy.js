@@ -28,24 +28,54 @@ export default async function handler(req, res) {
     return;
   }
 
+  // Bước 1: hỏi YouTube xem video này có những luồng audio nào (bắt buộc dùng
+  // ytdl-core, đây là bước YouTube hay chặn nhất theo kinh nghiệm thực tế).
+  let info;
   try {
-    const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
+    info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
       requestOptions: { headers: BROWSER_HEADERS },
     });
-    const audioFormats = ytdl.filterFormats(info.formats, "audioonly");
-    if (!audioFormats.length) {
-      res.status(404).json({ error: "Không tìm thấy luồng âm thanh cho video này." });
-      return;
-    }
-    // Chọn định dạng nhẹ nhất để tải và xử lý nhanh hơn (đủ dùng cho nhận diện giọng nói)
-    const best = [...audioFormats].sort((a, b) => (a.audioBitrate || 0) - (b.audioBitrate || 0))[0];
+  } catch (e) {
+    const raw = (e && e.message) || "không rõ nguyên nhân";
+    res.status(500).json({
+      error: "[Bước 1 - lấy thông tin video] " + describeError(raw),
+      step: "getInfo",
+      raw,
+    });
+    return;
+  }
 
-    const upstream = await fetch(best.url, { headers: BROWSER_HEADERS });
-    if (!upstream.ok || !upstream.body) {
-      res.status(502).json({ error: "Không tải được luồng âm thanh từ YouTube (máy chủ YouTube từ chối yêu cầu)." });
-      return;
-    }
+  const audioFormats = ytdl.filterFormats(info.formats, "audioonly");
+  if (!audioFormats.length) {
+    res.status(404).json({ error: "Không tìm thấy luồng âm thanh cho video này.", step: "no-audio-format" });
+    return;
+  }
+  // Chọn định dạng nhẹ nhất để tải và xử lý nhanh hơn (đủ dùng cho nhận diện giọng nói)
+  const best = [...audioFormats].sort((a, b) => (a.audioBitrate || 0) - (b.audioBitrate || 0))[0];
 
+  // Bước 2: tải luồng audio đã tìm được và chuyển tiếp cho trình duyệt.
+  let upstream;
+  try {
+    upstream = await fetch(best.url, { headers: BROWSER_HEADERS });
+  } catch (e) {
+    const raw = (e && e.message) || "không rõ nguyên nhân";
+    res.status(502).json({
+      error: "[Bước 2 - tải audio] " + describeError(raw),
+      step: "fetchAudio",
+      raw,
+    });
+    return;
+  }
+  if (!upstream.ok || !upstream.body) {
+    res.status(502).json({
+      error: `[Bước 2 - tải audio] YouTube từ chối yêu cầu (mã ${upstream.status}).`,
+      step: "fetchAudio",
+      raw: "http-" + upstream.status,
+    });
+    return;
+  }
+
+  try {
     res.setHeader("Content-Type", best.mimeType || "audio/mp4");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "no-store");
@@ -58,14 +88,20 @@ export default async function handler(req, res) {
     }
     res.end();
   } catch (e) {
-    const raw = (e && e.message) || "không rõ nguyên nhân";
-    // Lỗi phổ biến nhất trên các server "đám mây" (Vercel, AWS...): YouTube chặn
-    // IP không phải nhà mạng dân dụng, nghi ngờ là bot. Đây KHÔNG phải lỗi code —
-    // nhận diện sẵn để báo đúng nguyên nhân thay vì chỉ ghi "lỗi 500" chung chung.
-    const isBotBlock = /sign in|bot|confirm|429|forbidden|403/i.test(raw);
-    const friendly = isBotBlock
-      ? "YouTube đang chặn máy chủ (nghi ngờ là bot) — đây là hạn chế phía YouTube, không sửa được bằng code, cần đổi hướng khác (xem giải thích bên dưới)."
-      : "Lỗi khi lấy âm thanh: " + raw;
-    res.status(500).json({ error: friendly, raw });
+    // Lỗi ở đây thường là do vượt quá thời gian chạy tối đa của Vercel (video quá dài)
+    res.status(500).json({
+      error: "[Bước 2 - chuyển tiếp audio] Quá thời gian cho phép — thử video ngắn hơn.",
+      step: "streamAudio",
+      raw: (e && e.message) || "",
+    });
   }
+}
+
+function describeError(raw) {
+  // Lỗi phổ biến nhất trên các server "đám mây" (Vercel, AWS, Cloudflare...):
+  // YouTube chặn IP không phải nhà mạng dân dụng, nghi ngờ là bot.
+  const isBotBlock = /sign in|bot|confirm|429|forbidden|403/i.test(raw);
+  return isBotBlock
+    ? "YouTube đang chặn máy chủ (nghi ngờ là bot) — hạn chế phía YouTube, không sửa được bằng code."
+    : "Lỗi: " + raw;
 }
