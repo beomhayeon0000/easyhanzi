@@ -34,7 +34,7 @@ export default async function handler(req, res) {
 
     const upstream = await fetch(best.url);
     if (!upstream.ok || !upstream.body) {
-      res.status(502).json({ error: "Không tải được luồng âm thanh từ YouTube." });
+      res.status(502).json({ error: "Không tải được luồng âm thanh từ YouTube (máy chủ YouTube từ chối yêu cầu)." });
       return;
     }
 
@@ -50,6 +50,14 @@ export default async function handler(req, res) {
     }
     res.end();
   } catch (e) {
-    res.status(500).json({ error: "Lỗi khi lấy âm thanh: " + (e && e.message ? e.message : "không rõ nguyên nhân") });
+    const raw = (e && e.message) || "không rõ nguyên nhân";
+    // Lỗi phổ biến nhất trên các server "đám mây" (Vercel, AWS...): YouTube chặn
+    // IP không phải nhà mạng dân dụng, nghi ngờ là bot. Đây KHÔNG phải lỗi code —
+    // nhận diện sẵn để báo đúng nguyên nhân thay vì chỉ ghi "lỗi 500" chung chung.
+    const isBotBlock = /sign in|bot|confirm|429|forbidden|403/i.test(raw);
+    const friendly = isBotBlock
+      ? "YouTube đang chặn máy chủ (nghi ngờ là bot) — đây là hạn chế phía YouTube, không sửa được bằng code, cần đổi hướng khác (xem giải thích bên dưới)."
+      : "Lỗi khi lấy âm thanh: " + raw;
+    res.status(500).json({ error: friendly, raw });
   }
 }

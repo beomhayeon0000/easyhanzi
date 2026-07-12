@@ -8631,7 +8631,16 @@ async function loadWhisperPipeline(onProgress) {
 // và hạ tần số lấy mẫu đúng chuẩn.
 async function decodeAudioFromUrl(url) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error("Không tải được âm thanh (mã lỗi " + res.status + ")");
+  if (!res.ok) {
+    let detail = "mã lỗi " + res.status;
+    try {
+      const errJson = await res.clone().json();
+      if (errJson && errJson.error) detail = errJson.error;
+    } catch (e) {
+      /* phản hồi không phải JSON, giữ nguyên mã lỗi */
+    }
+    throw new Error("Không tải được âm thanh — " + detail);
+  }
   const buf = await res.arrayBuffer();
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   const audioCtx = new AudioCtx();
