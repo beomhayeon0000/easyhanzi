@@ -8121,9 +8121,341 @@ function WordBookView({ words, status }) {
 /* ---------------------------------------------------------
    TRA CỨU (tìm kiếm nhanh trên toàn bộ 3500 chữ)
 --------------------------------------------------------- */
+/* ---------------------------------------------------------
+   VẼ TAY ĐỂ TÌM CHỮ (nhận diện qua dịch vụ công khai của Google)
+--------------------------------------------------------- */
+function HandwritingInput({ open, onClose, onSelect }) {
+  const wrapRef = useRef(null);
+  const canvasRef = useRef(null);
+  const strokesRef = useRef([]);
+  const drawingRef = useRef(false);
+  const debounceRef = useRef(null);
+  const abortRef = useRef(null);
+  const rafRef = useRef(null);
+  const needsRedrawRef = useRef(false);
+  const [hasInk, setHasInk] = useState(false);
+  const [candidates, setCandidates] = useState([]);
+  const [status, setStatus] = useState("idle"); // idle | loading | ready | error
+  const [errorDetail, setErrorDetail] = useState("");
+
+  const CANVAS_SIZE = 280; // kích thước cố định tuyệt đối (px), không co giãn theo layout
+  const ENDPOINTS = [
+    "https://inputtools.google.com/request?ime=handwriting&app=mobilesearch&cs=1&oe=UTF-8",
+    "https://www.google.com/inputtools/request?ime=handwriting&app=translate&cs=1&oe=UTF-8",
+    "https://inputtools.google.com/request?ime=handwriting&app=translate&cs=1&oe=UTF-8",
+  ];
+
+  // Vẽ nét mượt bằng đường cong Bézier bậc 2 đi qua trung điểm mỗi cặp tọa độ liên tiếp,
+  // thay vì nối thẳng cứng — cùng kỹ thuật các app viết tay (kể cả Google) hay dùng.
+  const redraw = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = "#24201B";
+    ctx.lineWidth = 7;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    strokesRef.current.forEach((stroke) => {
+      if (stroke.length < 2) {
+        if (stroke.length === 1) {
+          // chỉ chấm 1 điểm (chưa kịp kéo) — vẫn vẽ 1 chấm tròn nhỏ cho có phản hồi
+          ctx.beginPath();
+          ctx.arc(stroke[0].x, stroke[0].y, ctx.lineWidth / 2, 0, Math.PI * 2);
+          ctx.fillStyle = "#24201B";
+          ctx.fill();
+        }
+        return;
+      }
+      ctx.beginPath();
+      ctx.moveTo(stroke[0].x, stroke[0].y);
+      for (let i = 1; i < stroke.length - 1; i++) {
+        const midX = (stroke[i].x + stroke[i + 1].x) / 2;
+        const midY = (stroke[i].y + stroke[i + 1].y) / 2;
+        ctx.quadraticCurveTo(stroke[i].x, stroke[i].y, midX, midY);
+      }
+      const last = stroke[stroke.length - 1];
+      ctx.lineTo(last.x, last.y);
+      ctx.stroke();
+    });
+  };
+
+  // Vòng lặp vẽ qua requestAnimationFrame: việc ghi nhận tọa độ (pointermove) chỉ đánh dấu
+  // "cần vẽ lại", còn việc thực sự vẽ lên canvas diễn ra đồng bộ theo khung hình của trình
+  // duyệt — giảm độ trễ/giật so với vẽ trực tiếp ngay trong sự kiện chạm.
+  useEffect(() => {
+    if (!open) return;
+    const loop = () => {
+      if (needsRedrawRef.current) {
+        redraw();
+        needsRedrawRef.current = false;
+      }
+      rafRef.current = requestAnimationFrame(loop);
+    };
+    rafRef.current = requestAnimationFrame(loop);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Canvas có kích thước pixel cố định (CANVAS_SIZE) và cũng được hiển thị đúng
+  // bằng kích thước đó (không dùng width:100%), nên tỉ lệ luôn là 1:1 — không
+  // còn khả năng bị lệch/méo do co giãn theo layout.
+  const posFromEvent = (e) => {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+    };
+  };
+
+  const scheduleAutoRecognize = (delay) => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => recognize(), delay);
+  };
+
+  const onPointerDown = (e) => {
+    e.preventDefault();
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    drawingRef.current = true;
+    strokesRef.current.push([posFromEvent(e)]);
+    needsRedrawRef.current = true;
+    canvasRef.current.setPointerCapture(e.pointerId);
+  };
+  const onPointerMove = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault();
+    strokesRef.current[strokesRef.current.length - 1].push(posFromEvent(e));
+    needsRedrawRef.current = true;
+  };
+  const onPointerUp = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault();
+    drawingRef.current = false;
+    setHasInk(strokesRef.current.length > 0);
+    // Nét đầu tiên: nhận diện gần như ngay lập tức để có gợi ý sớm nhất có thể.
+    // Các nét tiếp theo: chờ ngắn (250ms) để gộp nhiều nét gõ liên tiếp, đỡ gọi API liên tục.
+    scheduleAutoRecognize(strokesRef.current.length === 1 ? 120 : 250);
+  };
+
+  const clearCanvas = () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (abortRef.current) abortRef.current.abort();
+    strokesRef.current = [];
+    setHasInk(false);
+    setCandidates([]);
+    setStatus("idle");
+    redraw();
+  };
+
+  const tryEndpoint = async (url, body, signal) => {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (networkErr) {
+      // fetch tự nó ném lỗi (mất mạng, bị chặn CORS, DNS lỗi...) trước khi có phản hồi
+      throw new Error("network: " + (networkErr.message || "không kết nối được"));
+    }
+    if (!res.ok) {
+      throw new Error("http-" + res.status);
+    }
+    let data;
+    try {
+      data = await res.json();
+    } catch (parseErr) {
+      throw new Error("parse: phản hồi không đúng định dạng");
+    }
+    const list = data && data[0] === "SUCCESS" && data[1] && data[1][0] && data[1][0][1];
+    if (list && list.length) return list;
+    throw new Error("no-candidates: máy chủ phản hồi nhưng không nhận ra chữ này");
+  };
+
+  const recognize = async () => {
+    if (strokesRef.current.length === 0) return;
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setStatus("loading");
+    setErrorDetail("");
+    const ink = strokesRef.current.map((stroke) => [
+      stroke.map((p) => Math.round(p.x)),
+      stroke.map((p) => Math.round(p.y)),
+      [],
+    ]);
+    const body = {
+      options: "enable_pre_space",
+      requests: [
+        {
+          writing_guide: { writing_area_width: CANVAS_SIZE, writing_area_height: CANVAS_SIZE },
+          max_num_results: 10,
+          max_completions: 0,
+          language: "zh",
+          ink,
+        },
+      ],
+    };
+    const errors = [];
+    for (const url of ENDPOINTS) {
+      try {
+        const list = await tryEndpoint(url, body, controller.signal);
+        setCandidates(list.slice(0, 10));
+        setStatus("ready");
+        return;
+      } catch (e) {
+        if (e.name === "AbortError") return;
+        errors.push(e.message);
+      }
+    }
+    setCandidates([]);
+    setErrorDetail(errors[errors.length - 1] || "không rõ nguyên nhân");
+    setStatus("error");
+  };
+
+  useEffect(() => {
+    if (!open) clearCanvas();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Gắn listener touchmove trực tiếp (không qua React synthetic event, không passive)
+  // để đảm bảo chặn được việc cuộn/trôi trang trên mọi trình duyệt di động — một số
+  // trình duyệt bỏ qua preventDefault() gọi từ trong sự kiện React nếu listener gốc
+  // được đăng ký ở chế độ passive.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const wrap = wrapRef.current;
+    if (!open || !canvas || !wrap) return;
+    const block = (e) => e.preventDefault();
+    canvas.addEventListener("touchstart", block, { passive: false });
+    canvas.addEventListener("touchmove", block, { passive: false });
+    wrap.addEventListener("touchmove", block, { passive: false });
+    return () => {
+      canvas.removeEventListener("touchstart", block);
+      canvas.removeEventListener("touchmove", block);
+      wrap.removeEventListener("touchmove", block);
+    };
+  }, [open]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      ref={wrapRef}
+      style={{
+        border: "1px solid #D8CCAE",
+        background: "#F4EEDE",
+        borderRadius: 10,
+        padding: 14,
+        textAlign: "center",
+        touchAction: "none",
+        overscrollBehavior: "none",
+        marginBottom: 16,
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <button
+          onClick={onClose}
+          aria-label="Đóng"
+          style={{ background: "transparent", border: "none", cursor: "pointer", color: "#8A8072", padding: 2 }}
+        >
+          <X size={16} />
+        </button>
+      </div>
+
+      {/* Hàng gợi ý cố định chiều cao, luôn nằm phía trên khung vẽ để khung vẽ không bao giờ bị đẩy dịch chuyển */}
+      <div
+        style={{
+          minHeight: 52,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          flexWrap: "wrap",
+          gap: 8,
+          marginBottom: 6,
+          padding: "4px 0",
+        }}
+      >
+        {status === "loading" && <span style={{ fontSize: 12, color: "#8A8072" }}>Đang nhận diện...</span>}
+        {status === "error" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 12, color: "#B8432F" }}>Không nhận diện được — thử viết lại rõ nét hơn.</span>
+            {errorDetail && (
+              <span style={{ fontSize: 10, color: "#B0A488" }}>Chi tiết: {errorDetail}</span>
+            )}
+          </div>
+        )}
+        {status === "idle" && (
+          <span style={{ fontSize: 12, color: "#B0A488" }}>Viết một chữ Hán, gợi ý sẽ hiện ngay khi bạn nhấc bút</span>
+        )}
+        {status === "ready" &&
+          candidates.map((c, i) => (
+            <button
+              key={i}
+              onClick={() => {
+                onSelect(c);
+                onClose();
+                clearCanvas();
+              }}
+              style={{
+                fontFamily: "'Noto Serif SC', serif",
+                fontSize: 26,
+                lineHeight: 1,
+                padding: "6px 10px",
+                borderRadius: 8,
+                border: "1px solid #D8CCAE",
+                background: "#FBF7EC",
+                cursor: "pointer",
+              }}
+            >
+              {c}
+            </button>
+          ))}
+      </div>
+
+      <canvas
+        ref={canvasRef}
+        width={CANVAS_SIZE}
+        height={CANVAS_SIZE}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        style={{
+          touchAction: "none",
+          overscrollBehavior: "none",
+          background: "#FBF7EC",
+          border: "1px solid #E3D8BB",
+          borderRadius: 8,
+          width: CANVAS_SIZE,
+          height: CANVAS_SIZE,
+          display: "block",
+          margin: "0 auto",
+          cursor: "crosshair",
+          userSelect: "none",
+        }}
+      />
+      <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 10 }}>
+        <button onClick={clearCanvas} style={btnGhost}>Xóa</button>
+        <button onClick={recognize} style={{ ...btnKnown, opacity: hasInk ? 1 : 0.5 }} disabled={!hasInk}>
+          Nhận diện lại
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function SearchView({ allWords }) {
   const t = useT();
   const [query, setQuery] = useState("");
+  const [hwOpen, setHwOpen] = useState(false);
 
   const results = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -8152,7 +8484,7 @@ function SearchView({ allWords }) {
           placeholder={t("searchPlaceholder")}
           style={{
             width: "100%",
-            padding: "12px 14px 12px 36px",
+            padding: "12px 40px",
             borderRadius: 8,
             border: "1px solid #D8CCAE",
             background: "#F4EEDE",
@@ -8161,7 +8493,29 @@ function SearchView({ allWords }) {
             boxSizing: "border-box",
           }}
         />
+        <button
+          onClick={() => setHwOpen((o) => !o)}
+          title="Vẽ tay"
+          aria-label="Vẽ tay"
+          style={{
+            position: "absolute",
+            right: 8,
+            top: "50%",
+            transform: "translateY(-50%)",
+            background: hwOpen ? "#24201B" : "transparent",
+            color: hwOpen ? "#F4EEDE" : "#8A8072",
+            border: "none",
+            borderRadius: 6,
+            padding: 6,
+            cursor: "pointer",
+            display: "flex",
+          }}
+        >
+          <PenTool size={16} />
+        </button>
       </div>
+
+      <HandwritingInput open={hwOpen} onClose={() => setHwOpen(false)} onSelect={(c) => setQuery(c)} />
 
       {!query.trim() && (
         <div style={{ textAlign: "center", color: "#8A8072", fontSize: 13, padding: "20px 0" }}>
