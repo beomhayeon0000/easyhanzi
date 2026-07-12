@@ -8592,32 +8592,11 @@ const btnKnown = { ...btnBase, background: "#4C7A6D", color: "#F4EEDE" };
    PHỤ ĐỀ VIDEO YOUTUBE TIẾNG TRUNG (CC có sẵn, hoặc AI tạo phụ đề
    ngay trên trình duyệt khi video không có CC)
 --------------------------------------------------------- */
-function extractYouTubeId(url) {
-  const m = url.match(/^.*(?:youtu\.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/);
-  return m && m[1] && m[1].length === 11 ? m[1] : null;
-}
-
-let ytApiPromise = null;
-function loadYouTubeIframeAPI() {
-  if (typeof window === "undefined") return Promise.reject(new Error("no window"));
-  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
-  if (ytApiPromise) return ytApiPromise;
-  ytApiPromise = new Promise((resolve, reject) => {
-    window.onYouTubeIframeAPIReady = () => resolve(window.YT);
-    const tag = document.createElement("script");
-    tag.src = "https://www.youtube.com/iframe_api";
-    tag.onerror = () => reject(new Error("Không tải được YouTube player API"));
-    document.body.appendChild(tag);
-  });
-  return ytApiPromise;
-}
-
-// Whisper (transformers.js) giờ chạy trong Web Worker riêng (xem src/whisperWorker.js)
+// Whisper (transformers.js) chạy trong Web Worker riêng (xem src/whisperWorker.js)
 // để không làm đơ giao diện chính khi AI đang tính toán.
 
 // Whisper cần audio dạng mono 16kHz Float32Array — dùng Web Audio API để giải mã
-// và hạ tần số lấy mẫu đúng chuẩn. Dùng chung cho cả 2 nguồn: tải từ URL (qua
-// server) hoặc từ file người dùng tự chọn trên máy (không qua server).
+// và hạ tần số lấy mẫu đúng chuẩn.
 async function decodeArrayBufferToWhisperInput(buf) {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   const audioCtx = new AudioCtx();
@@ -8632,43 +8611,25 @@ async function decodeArrayBufferToWhisperInput(buf) {
   return rendered.getChannelData(0);
 }
 
-async function decodeAudioFromUrl(url) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    let detail = "mã lỗi " + res.status;
-    try {
-      const errJson = await res.clone().json();
-      if (errJson && errJson.error) detail = errJson.error;
-    } catch (e) {
-      /* phản hồi không phải JSON, giữ nguyên mã lỗi */
-    }
-    throw new Error("Không tải được âm thanh — " + detail);
-  }
-  const buf = await res.arrayBuffer();
-  return decodeArrayBufferToWhisperInput(buf);
-}
-
 // Đọc file âm thanh/video do người dùng tự chọn trên máy — hoàn toàn không qua
-// server, không đụng tới YouTube nên KHÔNG BAO GIỜ bị chặn bot.
+// server, không đụng tới YouTube nên KHÔNG BAO GIỜ bị chặn.
 async function decodeAudioFromFile(file) {
   const buf = await file.arrayBuffer();
   return decodeArrayBufferToWhisperInput(buf);
 }
 
 function SubtitleView() {
-  const [urlInput, setUrlInput] = useState("");
-  const [videoId, setVideoId] = useState(null);
   const [cues, setCues] = useState([]);
-  const [loadState, setLoadState] = useState("idle"); // idle | loading | ready | error | no-cc
-  const [errorMsg, setErrorMsg] = useState("");
+  const [mediaUrl, setMediaUrl] = useState(null);
+  const [mediaType, setMediaType] = useState(null); // "video" | "audio"
   const [mode, setMode] = useState("hanzi"); // hanzi | hanzi_pinyin
   const [currentText, setCurrentText] = useState("");
-  const [aiState, setAiState] = useState("idle"); // idle | downloading-model | transcribing | error
+  const [aiState, setAiState] = useState("idle"); // idle | loading-model | transcribing | done | error
   const [aiProgress, setAiProgress] = useState("");
-  const playerRef = useRef(null);
-  const playerDivId = useRef("yt-player-" + Math.random().toString(36).slice(2));
+  const mediaRef = useRef(null);
   const rafRef = useRef(null);
   const workerRef = useRef(null);
+  const mediaUrlRef = useRef(null);
 
   const getWorker = () => {
     if (!workerRef.current) {
@@ -8683,54 +8644,26 @@ function SubtitleView() {
         workerRef.current.terminate();
         workerRef.current = null;
       }
+      if (mediaUrlRef.current) URL.revokeObjectURL(mediaUrlRef.current);
     };
   }, []);
 
-  const fetchCC = async (id) => {
-    setLoadState("loading");
-    setErrorMsg("");
+  const handleFile = async (file) => {
+    if (!file) return;
     setCues([]);
-    setAiState("idle");
+    setCurrentText("");
+    setAiState("loading-model");
+    setAiProgress("Đang tải mô hình AI (khoảng 40-80MB tùy thiết bị, chỉ cần tải 1 lần)...");
+
+    const url = URL.createObjectURL(file);
+    if (mediaUrlRef.current) URL.revokeObjectURL(mediaUrlRef.current);
+    mediaUrlRef.current = url;
+    setMediaUrl(url);
+    setMediaType(file.type.startsWith("video") ? "video" : "audio");
+
     try {
-      const res = await fetch(`/api/subtitles?videoId=${id}`);
-      const data = await res.json();
-      if (res.ok && data.cues && data.cues.length) {
-        setCues(data.cues);
-        setLoadState("ready");
-      } else {
-        setErrorMsg(data.error || "Không tìm thấy phụ đề tiếng Trung có sẵn cho video này.");
-        setLoadState("no-cc");
-      }
-    } catch (e) {
-      setErrorMsg("Lỗi kết nối máy chủ.");
-      setLoadState("error");
-    }
-  };
-
-  const loadVideo = () => {
-    const id = extractYouTubeId(urlInput.trim());
-    if (!id) {
-      setErrorMsg("Link YouTube không hợp lệ.");
-      setLoadState("error");
-      return;
-    }
-    setVideoId(id);
-    fetchCC(id);
-  };
-
-  // Dùng chung cho cả 2 nguồn âm thanh (link YouTube qua server, hoặc file tự chọn
-  // trên máy) — phần chạy AI transcribe giống hệt nhau, chỉ khác cách lấy audioData.
-  // Việc tính toán AI thực sự diễn ra trong Web Worker (whisperWorker.js) để
-  // không làm đơ giao diện chính trong lúc xử lý.
-  const runTranscription = async (getAudioData) => {
-    setAiState("downloading-model");
-    setAiProgress("Đang tải âm thanh...");
-    try {
-      const audioData = await getAudioData();
-      setAiState("transcribing");
-      setAiProgress("Đang tải mô hình AI (khoảng 150MB, chỉ cần tải 1 lần)...");
-
-      const output = await new Promise((resolve, reject) => {
+      const audioData = await decodeAudioFromFile(file);
+      const resultCues = await new Promise((resolve, reject) => {
         const worker = getWorker();
         const handleMessage = (e) => {
           const { type, payload } = e.data || {};
@@ -8738,8 +8671,11 @@ function SubtitleView() {
             if (payload && payload.status === "progress") {
               setAiProgress(`Đang tải mô hình AI... ${Math.round(payload.progress || 0)}%`);
             }
-          } else if (type === "status" && payload === "transcribing") {
-            setAiProgress("AI đang nghe và tạo phụ đề (chạy nền, trang vẫn dùng được bình thường)...");
+          } else if (type === "device") {
+            setAiState("transcribing");
+            setAiProgress(payload === "webgpu" ? "Đang xử lý bằng GPU (nhanh hơn)..." : "Đang xử lý bằng CPU...");
+          } else if (type === "chunkProgress") {
+            setAiProgress(`Đang xử lý đoạn ${payload.index}/${payload.total}...`);
           } else if (type === "done") {
             worker.removeEventListener("message", handleMessage);
             resolve(payload);
@@ -8749,82 +8685,33 @@ function SubtitleView() {
           }
         };
         worker.addEventListener("message", handleMessage);
-        // Chuyển quyền sở hữu buffer cho worker (transferable) thay vì sao chép,
-        // nhanh và nhẹ bộ nhớ hơn với audio dài.
         worker.postMessage({ type: "transcribe", audioData }, [audioData.buffer]);
       });
 
-      const chunks = output && output.chunks ? output.chunks : [];
-      const newCues = chunks
-        .filter((c) => c.text && c.text.trim())
-        .map((c) => ({
-          start: (c.timestamp && c.timestamp[0]) || 0,
-          end: (c.timestamp && c.timestamp[1]) || ((c.timestamp && c.timestamp[0]) || 0) + 3,
-          text: c.text.trim(),
-        }));
-      if (!newCues.length) throw new Error("AI không nhận ra lời thoại tiếng Trung nào.");
-      setCues(newCues);
-      setLoadState("ready");
-      setAiState("idle");
+      if (!resultCues.length) throw new Error("AI không nhận ra lời thoại tiếng Trung nào trong file này.");
+      setCues(resultCues);
+      setAiState("done");
+      setAiProgress("");
     } catch (e) {
       setAiState("error");
-      setAiProgress((e && e.message) || "Có lỗi khi tạo phụ đề bằng AI, thử lại hoặc dùng cách khác.");
+      setAiProgress((e && e.message) || "Có lỗi khi tạo phụ đề, thử lại hoặc dùng file khác.");
     }
   };
 
-  const generateWithAI = () => {
-    if (!videoId) return;
-    setAiProgress("Đang tải âm thanh từ video...");
-    runTranscription(() => decodeAudioFromUrl(`/api/audio-proxy?videoId=${videoId}`));
-  };
-
-  // Tải file âm thanh/video từ máy người dùng — không đụng tới YouTube hay server
-  // nào cả, nên KHÔNG BAO GIỜ bị chặn bot. Đây là cách chắc chắn nhất khi cách lấy
-  // audio tự động từ link YouTube bị chặn.
-  const generateWithAIFromFile = (file) => {
-    if (!file) return;
-    setAiProgress(`Đang đọc file "${file.name}"...`);
-    runTranscription(() => decodeAudioFromFile(file));
-  };
-
   useEffect(() => {
-    if (!videoId || loadState !== "ready") return;
-    let cancelled = false;
-    loadYouTubeIframeAPI().then((YT) => {
-      if (cancelled) return;
-      if (playerRef.current && playerRef.current.loadVideoById) {
-        playerRef.current.loadVideoById(videoId);
-        return;
-      }
-      playerRef.current = new YT.Player(playerDivId.current, {
-        height: "100%",
-        width: "100%",
-        videoId,
-        playerVars: { rel: 0 },
-      });
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [videoId, loadState]);
-
-  useEffect(() => {
-    if (loadState !== "ready") return;
+    if (!mediaUrl || !cues.length) return;
     const loop = () => {
-      if (playerRef.current && playerRef.current.getCurrentTime) {
-        try {
-          const t = playerRef.current.getCurrentTime();
-          const cue = cues.find((c) => t >= c.start && t <= c.end);
-          setCurrentText(cue ? cue.text : "");
-        } catch (e) {
-          /* player chưa sẵn sàng, bỏ qua khung này */
-        }
+      const el = mediaRef.current;
+      if (el) {
+        const t = el.currentTime;
+        const cue = cues.find((c) => t >= c.start && t <= c.end);
+        setCurrentText(cue ? cue.text : "");
       }
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [loadState, cues]);
+  }, [mediaUrl, cues]);
 
   const pinyinText = useMemo(() => {
     if (!currentText) return "";
@@ -8852,144 +8739,76 @@ function SubtitleView() {
     </button>
   );
 
+  const busy = aiState === "loading-model" || aiState === "transcribing";
+
   return (
     <div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-        <input
-          value={urlInput}
-          onChange={(e) => setUrlInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && loadVideo()}
-          placeholder="Dán link YouTube tiếng Trung..."
+      <div style={{ textAlign: "center", marginBottom: 16 }}>
+        <label
           style={{
-            flex: 1,
-            padding: "10px 12px",
-            borderRadius: 8,
-            border: "1px solid #D8CCAE",
-            background: "#F4EEDE",
-            fontSize: 14,
-            boxSizing: "border-box",
-          }}
-        />
-        <button onClick={loadVideo} style={btnKnown}>Tải video</button>
-      </div>
-
-      {loadState === "loading" && (
-        <div style={{ textAlign: "center", color: "#8A8072", fontSize: 13, marginBottom: 12 }}>
-          Đang tìm phụ đề có sẵn...
-        </div>
-      )}
-      {(loadState === "error" || loadState === "no-cc") && (
-        <div
-          style={{
-            textAlign: "center",
-            color: loadState === "error" ? "#B8432F" : "#8A8072",
-            fontSize: 13,
-            marginBottom: 12,
+            ...btnKnown,
+            display: "inline-flex",
+            cursor: busy ? "default" : "pointer",
+            opacity: busy ? 0.6 : 1,
           }}
         >
-          {errorMsg}
-        </div>
-      )}
-
-      {loadState === "no-cc" && videoId && (
-        <div style={{ textAlign: "center", marginBottom: 16 }}>
-          <button
-            onClick={generateWithAI}
-            disabled={aiState === "downloading-model" || aiState === "transcribing"}
-            style={{
-              ...btnKnown,
-              opacity: aiState === "downloading-model" || aiState === "transcribing" ? 0.6 : 1,
-              margin: "0 auto",
+          📁 Chọn file âm thanh/video tiếng Trung
+          <input
+            type="file"
+            accept="audio/*,video/*"
+            disabled={busy}
+            onChange={(e) => {
+              const file = e.target.files && e.target.files[0];
+              if (file) handleFile(file);
+              e.target.value = "";
             }}
-          >
-            🤖 Tạo phụ đề bằng AI từ link YouTube
-          </button>
-          <div style={{ fontSize: 11, color: "#B0A488", marginTop: 6, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
-            Cách này đôi khi bị YouTube chặn (không phải lỗi của bạn). Nếu báo lỗi, dùng cách chắc chắn hơn bên
-            dưới.
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "16px auto", maxWidth: 300 }}>
-            <div style={{ flex: 1, height: 1, background: "#D8CCAE" }} />
-            <span style={{ fontSize: 11, color: "#B0A488" }}>hoặc</span>
-            <div style={{ flex: 1, height: 1, background: "#D8CCAE" }} />
-          </div>
-
-          <label
-            style={{
-              ...btnGhost,
-              display: "inline-flex",
-              margin: "0 auto",
-              cursor: aiState === "downloading-model" || aiState === "transcribing" ? "default" : "pointer",
-              opacity: aiState === "downloading-model" || aiState === "transcribing" ? 0.6 : 1,
-            }}
-          >
-            📁 Tải lên file âm thanh/video từ máy
-            <input
-              type="file"
-              accept="audio/*,video/*"
-              disabled={aiState === "downloading-model" || aiState === "transcribing"}
-              onChange={(e) => {
-                const file = e.target.files && e.target.files[0];
-                if (file) generateWithAIFromFile(file);
-                e.target.value = "";
-              }}
-              style={{ display: "none" }}
-            />
-          </label>
-          <div style={{ fontSize: 11, color: "#B0A488", marginTop: 6, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
-            Tải video/âm thanh về máy trước (ví dụ bằng phần mềm tải video bạn quen dùng), rồi chọn file đó ở đây —
-            cách này xử lý hoàn toàn trên máy bạn, không qua YouTube nên không bao giờ bị chặn.
-          </div>
-
-          <div style={{ fontSize: 11, color: "#B0A488", marginTop: 10, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
-            Lần đầu dùng AI cần tải mô hình (~150MB), có thể mất vài phút tùy độ dài audio, cấu hình máy và tốc độ
-            mạng. Nên dùng file/video ngắn (dưới 5 phút); máy tính hoặc điện thoại đời mới sẽ mượt hơn.
-          </div>
-          {(aiState === "downloading-model" || aiState === "transcribing") && (
-            <div style={{ fontSize: 12, color: "#4C7A6D", marginTop: 10 }}>{aiProgress}</div>
-          )}
-          {aiState === "error" && <div style={{ fontSize: 12, color: "#B8432F", marginTop: 10 }}>{aiProgress}</div>}
+            style={{ display: "none" }}
+          />
+        </label>
+        <div style={{ fontSize: 11, color: "#B0A488", marginTop: 8, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
+          Xử lý AI hoàn toàn trên máy bạn — không tải gì lên server, không cần đăng nhập. Lần đầu cần tải mô hình
+          AI, có thể mất vài phút tùy độ dài file. Nên dùng file dưới 10-15 phút; máy có card đồ họa rời sẽ nhanh
+          hơn nhiều.
         </div>
-      )}
+        {busy && <div style={{ fontSize: 12, color: "#4C7A6D", marginTop: 10 }}>{aiProgress}</div>}
+        {aiState === "error" && <div style={{ fontSize: 12, color: "#B8432F", marginTop: 10 }}>{aiProgress}</div>}
+      </div>
 
-      {videoId && loadState === "ready" && (
+      {mediaUrl && (
         <>
-          <div
-            style={{
-              position: "relative",
-              paddingTop: "56.25%",
-              borderRadius: 10,
-              overflow: "hidden",
-              marginBottom: 12,
-              background: "#000",
-            }}
-          >
-            <div id={playerDivId.current} style={{ position: "absolute", inset: 0 }} />
-          </div>
-
-          <div style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 12 }}>
-            {modeChip("hanzi", "Giản thể")}
-            {modeChip("hanzi_pinyin", "Giản thể + Pinyin")}
-          </div>
-
-          <div
-            style={{
-              minHeight: 90,
-              textAlign: "center",
-              padding: 16,
-              background: "#F4EEDE",
-              border: "1px solid #D8CCAE",
-              borderRadius: 10,
-            }}
-          >
-            {mode === "hanzi_pinyin" && currentText && (
-              <div style={{ fontSize: 14, color: "#4C7A6D", marginBottom: 4 }}>{pinyinText}</div>
+          <div style={{ borderRadius: 10, overflow: "hidden", marginBottom: 12, background: "#000" }}>
+            {mediaType === "video" ? (
+              <video ref={mediaRef} src={mediaUrl} controls style={{ width: "100%", display: "block" }} />
+            ) : (
+              <audio ref={mediaRef} src={mediaUrl} controls style={{ width: "100%" }} />
             )}
-            <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 24, color: "#24201B" }}>
-              {currentText || "···"}
-            </div>
           </div>
+
+          {cues.length > 0 && (
+            <>
+              <div style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 12 }}>
+                {modeChip("hanzi", "Giản thể")}
+                {modeChip("hanzi_pinyin", "Giản thể + Pinyin")}
+              </div>
+              <div
+                style={{
+                  minHeight: 90,
+                  textAlign: "center",
+                  padding: 16,
+                  background: "#F4EEDE",
+                  border: "1px solid #D8CCAE",
+                  borderRadius: 10,
+                }}
+              >
+                {mode === "hanzi_pinyin" && currentText && (
+                  <div style={{ fontSize: 14, color: "#4C7A6D", marginBottom: 4 }}>{pinyinText}</div>
+                )}
+                <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 24, color: "#24201B" }}>
+                  {currentText || "···"}
+                </div>
+              </div>
+            </>
+          )}
         </>
       )}
     </div>
@@ -9170,7 +8989,7 @@ export default function App() {
         <TabButton icon={PenTool} label={t("tabWrite")} active={tab === "write"} onClick={() => setTab("write")} />
         <TabButton icon={BookOpen} label={t("tabBook")} active={tab === "book"} onClick={() => setTab("book")} />
         <TabButton icon={Search} label={t("tabSearch")} active={tab === "search"} onClick={() => setTab("search")} />
-        <TabButton icon={Youtube} label="Phụ đề" active={tab === "subtitle"} onClick={() => setTab("subtitle")} />
+        <TabButton icon={Captions} label="Phụ đề" active={tab === "subtitle"} onClick={() => setTab("subtitle")} />
         <TabButton icon={User} label="Tài khoản" active={tab === "account"} onClick={() => setTab("account")} />
       </nav>
 

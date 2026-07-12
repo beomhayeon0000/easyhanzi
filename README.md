@@ -129,33 +129,33 @@ chuyển khoản và tự bật `is_paid` qua webhook — cứ quay lại hỏi 
 
 ---
 
-## PHẦN D — Phụ đề video YouTube tiếng Trung (CC có sẵn + AI tạo phụ đề miễn phí)
+## PHẦN D — Phụ đề tiếng Trung bằng AI (tải file lên, chạy hoàn toàn trên trình duyệt)
 
-Tính năng ở tab **Phụ đề**: dán link YouTube nói tiếng Trung, xem 2 chế độ hiển thị
-đồng bộ theo video — chỉ giản thể, hoặc giản thể kèm pinyin.
+Tính năng ở tab **Phụ đề**: chọn 1 file âm thanh/video tiếng Trung có sẵn trên máy
+(ví dụ video đã tải về từ YouTube bằng phần mềm quen dùng), AI sẽ tự nghe và tạo
+phụ đề, đồng bộ theo đúng thời gian phát — xem ở 2 chế độ: chỉ giản thể, hoặc giản
+thể kèm pinyin.
 
-**Không cần đăng ký hay cấu hình gì thêm** — không dùng API trả phí nào ở tính năng
-này (khác với trợ lý AI ở Phần C2).
+**Không cần đăng ký hay cấu hình gì thêm, không tốn phí** — mọi thứ chạy ngay trên
+máy người dùng (dùng Whisper qua `transformers.js`), không tải gì lên server, nên
+**không thể bị chặn hay giới hạn** như cách lấy trực tiếp từ link YouTube (đã thử và
+bỏ vì hay bị YouTube chặn).
 
 ### Cách hoạt động
-1. Trước tiên hệ thống tự tìm phụ đề (CC) có sẵn của chính video đó trên YouTube —
-   nhanh, miễn phí, không giới hạn độ dài video.
-2. Nếu video không có CC tiếng Trung, sẽ hiện nút **"Tạo phụ đề bằng AI"** — AI
-   (Whisper, chạy bằng WebAssembly) sẽ tự nghe và tạo phụ đề **ngay trên trình
-   duyệt của người dùng**, hoàn toàn miễn phí, không tốn gì phía bạn.
-   - Lần đầu dùng cần tải mô hình AI (~150MB), các lần sau nhanh hơn nhờ trình
-     duyệt tự lưu cache.
-   - Chỉ nên dùng cho **video ngắn (dưới 5 phút)** — vì bước lấy âm thanh vẫn cần
-     đi qua 1 hàm máy chủ nhỏ (`api/audio-proxy.js`), và gói Vercel miễn phí giới
-     hạn mỗi hàm chạy tối đa khoảng 10 giây.
-   - Trên điện thoại đời cũ, bước AI xử lý có thể chậm hoặc giật — máy tính sẽ mượt
-     hơn nhiều.
+1. Người dùng bấm **"Chọn file âm thanh/video tiếng Trung"**, chọn file trên máy.
+2. Trình duyệt tự giải mã âm thanh, chia nhỏ thành từng đoạn 30 giây.
+3. AI (mô hình `whisper-tiny`, chạy trong Web Worker riêng — không làm đơ trang)
+   xử lý lần lượt từng đoạn, luôn hiện tiến trình rõ ràng ("Đang xử lý đoạn 5/30...").
+   Nếu máy có card đồ họa hỗ trợ WebGPU, tự động dùng để tăng tốc; nếu không, tự
+   động lùi về chạy bằng CPU.
+4. Xong, video/audio hiện ra kèm phụ đề đồng bộ theo thời gian thực khi phát.
 
-### Rủi ro cần biết
-- `api/subtitles.js` và `api/audio-proxy.js` dùng các endpoint không chính thức của
-  YouTube — dùng cho mục đích học tập cá nhân. YouTube có thể thay đổi cơ chế nội bộ
-  bất kỳ lúc nào khiến tính năng cần được cập nhật lại (giống rủi ro của tính năng
-  vẽ tay tìm chữ ở Phần vẽ tay).
+### Lưu ý
+- Lần đầu dùng cần tải mô hình AI, các lần sau nhanh hơn nhờ trình duyệt tự lưu cache.
+- Nên dùng file dưới 10-15 phút — file càng dài, AI càng mất nhiều thời gian xử lý
+  (vì chạy bằng chính máy người dùng, không phải server mạnh).
+- Trên điện thoại đời cũ, bước AI xử lý có thể chậm — máy tính hoặc điện thoại đời
+  mới có GPU hỗ trợ WebGPU sẽ nhanh hơn nhiều.
 
 ---
 
