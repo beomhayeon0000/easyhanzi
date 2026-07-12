@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef, useContext, createContext } from "react";
-import { Check, X, ChevronLeft, ChevronRight, BookOpen, Layers, ClipboardList, RefreshCw, Lock, Volume2, PenTool, Search, Shuffle, User, MessageCircle } from "lucide-react";
+import { pinyin } from "pinyin-pro";
+import { Check, X, ChevronLeft, ChevronRight, BookOpen, Layers, ClipboardList, RefreshCw, Lock, Volume2, PenTool, Search, Shuffle, User, MessageCircle, Youtube, Captions } from "lucide-react";
 import AuthPanel from "./AuthPanel.jsx";
 
 /* ---------------------------------------------------------
@@ -8121,9 +8122,341 @@ function WordBookView({ words, status }) {
 /* ---------------------------------------------------------
    TRA CỨU (tìm kiếm nhanh trên toàn bộ 3500 chữ)
 --------------------------------------------------------- */
+/* ---------------------------------------------------------
+   VẼ TAY ĐỂ TÌM CHỮ (nhận diện qua dịch vụ công khai của Google)
+--------------------------------------------------------- */
+function HandwritingInput({ open, onClose, onSelect }) {
+  const wrapRef = useRef(null);
+  const canvasRef = useRef(null);
+  const strokesRef = useRef([]);
+  const drawingRef = useRef(false);
+  const debounceRef = useRef(null);
+  const abortRef = useRef(null);
+  const rafRef = useRef(null);
+  const needsRedrawRef = useRef(false);
+  const [hasInk, setHasInk] = useState(false);
+  const [candidates, setCandidates] = useState([]);
+  const [status, setStatus] = useState("idle"); // idle | loading | ready | error
+  const [errorDetail, setErrorDetail] = useState("");
+
+  const CANVAS_SIZE = 280; // kích thước cố định tuyệt đối (px), không co giãn theo layout
+  const ENDPOINTS = [
+    "https://inputtools.google.com/request?ime=handwriting&app=mobilesearch&cs=1&oe=UTF-8",
+    "https://www.google.com/inputtools/request?ime=handwriting&app=translate&cs=1&oe=UTF-8",
+    "https://inputtools.google.com/request?ime=handwriting&app=translate&cs=1&oe=UTF-8",
+  ];
+
+  // Vẽ nét mượt bằng đường cong Bézier bậc 2 đi qua trung điểm mỗi cặp tọa độ liên tiếp,
+  // thay vì nối thẳng cứng — cùng kỹ thuật các app viết tay (kể cả Google) hay dùng.
+  const redraw = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = "#24201B";
+    ctx.lineWidth = 7;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    strokesRef.current.forEach((stroke) => {
+      if (stroke.length < 2) {
+        if (stroke.length === 1) {
+          // chỉ chấm 1 điểm (chưa kịp kéo) — vẫn vẽ 1 chấm tròn nhỏ cho có phản hồi
+          ctx.beginPath();
+          ctx.arc(stroke[0].x, stroke[0].y, ctx.lineWidth / 2, 0, Math.PI * 2);
+          ctx.fillStyle = "#24201B";
+          ctx.fill();
+        }
+        return;
+      }
+      ctx.beginPath();
+      ctx.moveTo(stroke[0].x, stroke[0].y);
+      for (let i = 1; i < stroke.length - 1; i++) {
+        const midX = (stroke[i].x + stroke[i + 1].x) / 2;
+        const midY = (stroke[i].y + stroke[i + 1].y) / 2;
+        ctx.quadraticCurveTo(stroke[i].x, stroke[i].y, midX, midY);
+      }
+      const last = stroke[stroke.length - 1];
+      ctx.lineTo(last.x, last.y);
+      ctx.stroke();
+    });
+  };
+
+  // Vòng lặp vẽ qua requestAnimationFrame: việc ghi nhận tọa độ (pointermove) chỉ đánh dấu
+  // "cần vẽ lại", còn việc thực sự vẽ lên canvas diễn ra đồng bộ theo khung hình của trình
+  // duyệt — giảm độ trễ/giật so với vẽ trực tiếp ngay trong sự kiện chạm.
+  useEffect(() => {
+    if (!open) return;
+    const loop = () => {
+      if (needsRedrawRef.current) {
+        redraw();
+        needsRedrawRef.current = false;
+      }
+      rafRef.current = requestAnimationFrame(loop);
+    };
+    rafRef.current = requestAnimationFrame(loop);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Canvas có kích thước pixel cố định (CANVAS_SIZE) và cũng được hiển thị đúng
+  // bằng kích thước đó (không dùng width:100%), nên tỉ lệ luôn là 1:1 — không
+  // còn khả năng bị lệch/méo do co giãn theo layout.
+  const posFromEvent = (e) => {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+    };
+  };
+
+  const scheduleAutoRecognize = (delay) => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => recognize(), delay);
+  };
+
+  const onPointerDown = (e) => {
+    e.preventDefault();
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    drawingRef.current = true;
+    strokesRef.current.push([posFromEvent(e)]);
+    needsRedrawRef.current = true;
+    canvasRef.current.setPointerCapture(e.pointerId);
+  };
+  const onPointerMove = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault();
+    strokesRef.current[strokesRef.current.length - 1].push(posFromEvent(e));
+    needsRedrawRef.current = true;
+  };
+  const onPointerUp = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault();
+    drawingRef.current = false;
+    setHasInk(strokesRef.current.length > 0);
+    // Nét đầu tiên: nhận diện gần như ngay lập tức để có gợi ý sớm nhất có thể.
+    // Các nét tiếp theo: chờ ngắn (250ms) để gộp nhiều nét gõ liên tiếp, đỡ gọi API liên tục.
+    scheduleAutoRecognize(strokesRef.current.length === 1 ? 120 : 250);
+  };
+
+  const clearCanvas = () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (abortRef.current) abortRef.current.abort();
+    strokesRef.current = [];
+    setHasInk(false);
+    setCandidates([]);
+    setStatus("idle");
+    redraw();
+  };
+
+  const tryEndpoint = async (url, body, signal) => {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (networkErr) {
+      // fetch tự nó ném lỗi (mất mạng, bị chặn CORS, DNS lỗi...) trước khi có phản hồi
+      throw new Error("network: " + (networkErr.message || "không kết nối được"));
+    }
+    if (!res.ok) {
+      throw new Error("http-" + res.status);
+    }
+    let data;
+    try {
+      data = await res.json();
+    } catch (parseErr) {
+      throw new Error("parse: phản hồi không đúng định dạng");
+    }
+    const list = data && data[0] === "SUCCESS" && data[1] && data[1][0] && data[1][0][1];
+    if (list && list.length) return list;
+    throw new Error("no-candidates: máy chủ phản hồi nhưng không nhận ra chữ này");
+  };
+
+  const recognize = async () => {
+    if (strokesRef.current.length === 0) return;
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setStatus("loading");
+    setErrorDetail("");
+    const ink = strokesRef.current.map((stroke) => [
+      stroke.map((p) => Math.round(p.x)),
+      stroke.map((p) => Math.round(p.y)),
+      [],
+    ]);
+    const body = {
+      options: "enable_pre_space",
+      requests: [
+        {
+          writing_guide: { writing_area_width: CANVAS_SIZE, writing_area_height: CANVAS_SIZE },
+          max_num_results: 10,
+          max_completions: 0,
+          language: "zh",
+          ink,
+        },
+      ],
+    };
+    const errors = [];
+    for (const url of ENDPOINTS) {
+      try {
+        const list = await tryEndpoint(url, body, controller.signal);
+        setCandidates(list.slice(0, 10));
+        setStatus("ready");
+        return;
+      } catch (e) {
+        if (e.name === "AbortError") return;
+        errors.push(e.message);
+      }
+    }
+    setCandidates([]);
+    setErrorDetail(errors[errors.length - 1] || "không rõ nguyên nhân");
+    setStatus("error");
+  };
+
+  useEffect(() => {
+    if (!open) clearCanvas();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Gắn listener touchmove trực tiếp (không qua React synthetic event, không passive)
+  // để đảm bảo chặn được việc cuộn/trôi trang trên mọi trình duyệt di động — một số
+  // trình duyệt bỏ qua preventDefault() gọi từ trong sự kiện React nếu listener gốc
+  // được đăng ký ở chế độ passive.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const wrap = wrapRef.current;
+    if (!open || !canvas || !wrap) return;
+    const block = (e) => e.preventDefault();
+    canvas.addEventListener("touchstart", block, { passive: false });
+    canvas.addEventListener("touchmove", block, { passive: false });
+    wrap.addEventListener("touchmove", block, { passive: false });
+    return () => {
+      canvas.removeEventListener("touchstart", block);
+      canvas.removeEventListener("touchmove", block);
+      wrap.removeEventListener("touchmove", block);
+    };
+  }, [open]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      ref={wrapRef}
+      style={{
+        border: "1px solid #D8CCAE",
+        background: "#F4EEDE",
+        borderRadius: 10,
+        padding: 14,
+        textAlign: "center",
+        touchAction: "none",
+        overscrollBehavior: "none",
+        marginBottom: 16,
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <button
+          onClick={onClose}
+          aria-label="Đóng"
+          style={{ background: "transparent", border: "none", cursor: "pointer", color: "#8A8072", padding: 2 }}
+        >
+          <X size={16} />
+        </button>
+      </div>
+
+      {/* Hàng gợi ý cố định chiều cao, luôn nằm phía trên khung vẽ để khung vẽ không bao giờ bị đẩy dịch chuyển */}
+      <div
+        style={{
+          minHeight: 52,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          flexWrap: "wrap",
+          gap: 8,
+          marginBottom: 6,
+          padding: "4px 0",
+        }}
+      >
+        {status === "loading" && <span style={{ fontSize: 12, color: "#8A8072" }}>Đang nhận diện...</span>}
+        {status === "error" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 12, color: "#B8432F" }}>Không nhận diện được — thử viết lại rõ nét hơn.</span>
+            {errorDetail && (
+              <span style={{ fontSize: 10, color: "#B0A488" }}>Chi tiết: {errorDetail}</span>
+            )}
+          </div>
+        )}
+        {status === "idle" && (
+          <span style={{ fontSize: 12, color: "#B0A488" }}>Viết một chữ Hán, gợi ý sẽ hiện ngay khi bạn nhấc bút</span>
+        )}
+        {status === "ready" &&
+          candidates.map((c, i) => (
+            <button
+              key={i}
+              onClick={() => {
+                onSelect(c);
+                onClose();
+                clearCanvas();
+              }}
+              style={{
+                fontFamily: "'Noto Serif SC', serif",
+                fontSize: 26,
+                lineHeight: 1,
+                padding: "6px 10px",
+                borderRadius: 8,
+                border: "1px solid #D8CCAE",
+                background: "#FBF7EC",
+                cursor: "pointer",
+              }}
+            >
+              {c}
+            </button>
+          ))}
+      </div>
+
+      <canvas
+        ref={canvasRef}
+        width={CANVAS_SIZE}
+        height={CANVAS_SIZE}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        style={{
+          touchAction: "none",
+          overscrollBehavior: "none",
+          background: "#FBF7EC",
+          border: "1px solid #E3D8BB",
+          borderRadius: 8,
+          width: CANVAS_SIZE,
+          height: CANVAS_SIZE,
+          display: "block",
+          margin: "0 auto",
+          cursor: "crosshair",
+          userSelect: "none",
+        }}
+      />
+      <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 10 }}>
+        <button onClick={clearCanvas} style={btnGhost}>Xóa</button>
+        <button onClick={recognize} style={{ ...btnKnown, opacity: hasInk ? 1 : 0.5 }} disabled={!hasInk}>
+          Nhận diện lại
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function SearchView({ allWords }) {
   const t = useT();
   const [query, setQuery] = useState("");
+  const [hwOpen, setHwOpen] = useState(false);
 
   const results = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -8152,7 +8485,7 @@ function SearchView({ allWords }) {
           placeholder={t("searchPlaceholder")}
           style={{
             width: "100%",
-            padding: "12px 14px 12px 36px",
+            padding: "12px 40px",
             borderRadius: 8,
             border: "1px solid #D8CCAE",
             background: "#F4EEDE",
@@ -8161,7 +8494,29 @@ function SearchView({ allWords }) {
             boxSizing: "border-box",
           }}
         />
+        <button
+          onClick={() => setHwOpen((o) => !o)}
+          title="Vẽ tay"
+          aria-label="Vẽ tay"
+          style={{
+            position: "absolute",
+            right: 8,
+            top: "50%",
+            transform: "translateY(-50%)",
+            background: hwOpen ? "#24201B" : "transparent",
+            color: hwOpen ? "#F4EEDE" : "#8A8072",
+            border: "none",
+            borderRadius: 6,
+            padding: 6,
+            cursor: "pointer",
+            display: "flex",
+          }}
+        >
+          <PenTool size={16} />
+        </button>
       </div>
+
+      <HandwritingInput open={hwOpen} onClose={() => setHwOpen(false)} onSelect={(c) => setQuery(c)} />
 
       {!query.trim() && (
         <div style={{ textAlign: "center", color: "#8A8072", fontSize: 13, padding: "20px 0" }}>
@@ -8232,6 +8587,350 @@ const btnBase = {
 const btnGhost = { ...btnBase, background: "transparent", border: "1px solid #D8CCAE", color: "#6B5F52", padding: 10 };
 const btnLearning = { ...btnBase, background: "#EADFC4", color: "#8E6B22" };
 const btnKnown = { ...btnBase, background: "#4C7A6D", color: "#F4EEDE" };
+
+/* ---------------------------------------------------------
+   PHỤ ĐỀ VIDEO YOUTUBE TIẾNG TRUNG (CC có sẵn, hoặc AI tạo phụ đề
+   ngay trên trình duyệt khi video không có CC)
+--------------------------------------------------------- */
+function extractYouTubeId(url) {
+  const m = url.match(/^.*(?:youtu\.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/);
+  return m && m[1] && m[1].length === 11 ? m[1] : null;
+}
+
+let ytApiPromise = null;
+function loadYouTubeIframeAPI() {
+  if (typeof window === "undefined") return Promise.reject(new Error("no window"));
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+  if (ytApiPromise) return ytApiPromise;
+  ytApiPromise = new Promise((resolve, reject) => {
+    window.onYouTubeIframeAPIReady = () => resolve(window.YT);
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    tag.onerror = () => reject(new Error("Không tải được YouTube player API"));
+    document.body.appendChild(tag);
+  });
+  return ytApiPromise;
+}
+
+// Whisper (transformers.js) chỉ được tải khi người dùng thật sự bấm "Tạo phụ đề
+// bằng AI" — thư viện khá nặng (mô hình ~150MB) nên không tải trước, tránh làm
+// chậm app cho những người không dùng tới tính năng này.
+let whisperPipelinePromise = null;
+async function importTransformersWithRetry(maxAttempts = 3) {
+  let lastErr;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      return await import("@xenova/transformers");
+    } catch (e) {
+      lastErr = e;
+      // Chờ một chút rồi thử lại — lỗi "Failed to fetch dynamically imported module"
+      // thường chỉ là mạng bị ngắt giữa chừng khi tải file lớn, thử lại là qua.
+      await new Promise((r) => setTimeout(r, 800 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+async function loadWhisperPipeline(onProgress) {
+  if (whisperPipelinePromise) return whisperPipelinePromise;
+  whisperPipelinePromise = (async () => {
+    try {
+      const { pipeline } = await importTransformersWithRetry();
+      return await pipeline("automatic-speech-recognition", "Xenova/whisper-base", {
+        progress_callback: onProgress,
+      });
+    } catch (e) {
+      // Cho phép lần bấm nút tiếp theo được thử tải lại từ đầu thay vì kẹt lỗi mãi mãi
+      whisperPipelinePromise = null;
+      throw new Error("Không tải được thư viện AI — có thể do mạng bị ngắt. Hãy tải lại trang (Ctrl+F5) rồi thử lại.");
+    }
+  })();
+  return whisperPipelinePromise;
+}
+
+// Whisper cần audio dạng mono 16kHz Float32Array — dùng Web Audio API để giải mã
+// và hạ tần số lấy mẫu đúng chuẩn.
+async function decodeAudioFromUrl(url) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    let detail = "mã lỗi " + res.status;
+    try {
+      const errJson = await res.clone().json();
+      if (errJson && errJson.error) detail = errJson.error;
+    } catch (e) {
+      /* phản hồi không phải JSON, giữ nguyên mã lỗi */
+    }
+    throw new Error("Không tải được âm thanh — " + detail);
+  }
+  const buf = await res.arrayBuffer();
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const audioCtx = new AudioCtx();
+  const decoded = await audioCtx.decodeAudioData(buf);
+  const targetRate = 16000;
+  const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * targetRate), targetRate);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  return rendered.getChannelData(0);
+}
+
+function SubtitleView() {
+  const [urlInput, setUrlInput] = useState("");
+  const [videoId, setVideoId] = useState(null);
+  const [cues, setCues] = useState([]);
+  const [loadState, setLoadState] = useState("idle"); // idle | loading | ready | error | no-cc
+  const [errorMsg, setErrorMsg] = useState("");
+  const [mode, setMode] = useState("hanzi"); // hanzi | hanzi_pinyin
+  const [currentText, setCurrentText] = useState("");
+  const [aiState, setAiState] = useState("idle"); // idle | downloading-model | transcribing | error
+  const [aiProgress, setAiProgress] = useState("");
+  const playerRef = useRef(null);
+  const playerDivId = useRef("yt-player-" + Math.random().toString(36).slice(2));
+  const rafRef = useRef(null);
+
+  const fetchCC = async (id) => {
+    setLoadState("loading");
+    setErrorMsg("");
+    setCues([]);
+    setAiState("idle");
+    try {
+      const res = await fetch(`/api/subtitles?videoId=${id}`);
+      const data = await res.json();
+      if (res.ok && data.cues && data.cues.length) {
+        setCues(data.cues);
+        setLoadState("ready");
+      } else {
+        setErrorMsg(data.error || "Không tìm thấy phụ đề tiếng Trung có sẵn cho video này.");
+        setLoadState("no-cc");
+      }
+    } catch (e) {
+      setErrorMsg("Lỗi kết nối máy chủ.");
+      setLoadState("error");
+    }
+  };
+
+  const loadVideo = () => {
+    const id = extractYouTubeId(urlInput.trim());
+    if (!id) {
+      setErrorMsg("Link YouTube không hợp lệ.");
+      setLoadState("error");
+      return;
+    }
+    setVideoId(id);
+    fetchCC(id);
+  };
+
+  const generateWithAI = async () => {
+    if (!videoId) return;
+    setAiState("downloading-model");
+    setAiProgress("Đang tải mô hình AI (khoảng 150MB, chỉ cần tải 1 lần)...");
+    try {
+      const transcriber = await loadWhisperPipeline((p) => {
+        if (p.status === "progress") {
+          setAiProgress(`Đang tải mô hình AI... ${Math.round(p.progress || 0)}%`);
+        }
+      });
+      setAiState("transcribing");
+      setAiProgress("Đang tải âm thanh từ video...");
+      const audioData = await decodeAudioFromUrl(`/api/audio-proxy?videoId=${videoId}`);
+      setAiProgress("AI đang nghe và tạo phụ đề — video càng dài càng lâu, vui lòng chờ...");
+      const output = await transcriber(audioData, {
+        language: "chinese",
+        task: "transcribe",
+        return_timestamps: true,
+        chunk_length_s: 30,
+        stride_length_s: 5,
+      });
+      const chunks = output && output.chunks ? output.chunks : [];
+      const newCues = chunks
+        .filter((c) => c.text && c.text.trim())
+        .map((c) => ({
+          start: (c.timestamp && c.timestamp[0]) || 0,
+          end: (c.timestamp && c.timestamp[1]) || ((c.timestamp && c.timestamp[0]) || 0) + 3,
+          text: c.text.trim(),
+        }));
+      if (!newCues.length) throw new Error("AI không nhận ra lời thoại tiếng Trung nào trong video này.");
+      setCues(newCues);
+      setLoadState("ready");
+      setAiState("idle");
+    } catch (e) {
+      setAiState("error");
+      setAiProgress((e && e.message) || "Có lỗi khi tạo phụ đề bằng AI, thử lại hoặc dùng video khác.");
+    }
+  };
+
+  useEffect(() => {
+    if (!videoId || loadState !== "ready") return;
+    let cancelled = false;
+    loadYouTubeIframeAPI().then((YT) => {
+      if (cancelled) return;
+      if (playerRef.current && playerRef.current.loadVideoById) {
+        playerRef.current.loadVideoById(videoId);
+        return;
+      }
+      playerRef.current = new YT.Player(playerDivId.current, {
+        height: "100%",
+        width: "100%",
+        videoId,
+        playerVars: { rel: 0 },
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [videoId, loadState]);
+
+  useEffect(() => {
+    if (loadState !== "ready") return;
+    const loop = () => {
+      if (playerRef.current && playerRef.current.getCurrentTime) {
+        try {
+          const t = playerRef.current.getCurrentTime();
+          const cue = cues.find((c) => t >= c.start && t <= c.end);
+          setCurrentText(cue ? cue.text : "");
+        } catch (e) {
+          /* player chưa sẵn sàng, bỏ qua khung này */
+        }
+      }
+      rafRef.current = requestAnimationFrame(loop);
+    };
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [loadState, cues]);
+
+  const pinyinText = useMemo(() => {
+    if (!currentText) return "";
+    try {
+      return pinyin(currentText, { toneType: "symbol", type: "string", separator: " " });
+    } catch (e) {
+      return "";
+    }
+  }, [currentText]);
+
+  const modeChip = (id, label) => (
+    <button
+      onClick={() => setMode(id)}
+      style={{
+        padding: "6px 14px",
+        borderRadius: 999,
+        fontSize: 13,
+        cursor: "pointer",
+        border: `1px solid ${mode === id ? "#B8432F" : "#D8CCAE"}`,
+        background: mode === id ? "#B8432F" : "transparent",
+        color: mode === id ? "#F4EEDE" : "#6B5F52",
+      }}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+        <input
+          value={urlInput}
+          onChange={(e) => setUrlInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && loadVideo()}
+          placeholder="Dán link YouTube tiếng Trung..."
+          style={{
+            flex: 1,
+            padding: "10px 12px",
+            borderRadius: 8,
+            border: "1px solid #D8CCAE",
+            background: "#F4EEDE",
+            fontSize: 14,
+            boxSizing: "border-box",
+          }}
+        />
+        <button onClick={loadVideo} style={btnKnown}>Tải video</button>
+      </div>
+
+      {loadState === "loading" && (
+        <div style={{ textAlign: "center", color: "#8A8072", fontSize: 13, marginBottom: 12 }}>
+          Đang tìm phụ đề có sẵn...
+        </div>
+      )}
+      {(loadState === "error" || loadState === "no-cc") && (
+        <div
+          style={{
+            textAlign: "center",
+            color: loadState === "error" ? "#B8432F" : "#8A8072",
+            fontSize: 13,
+            marginBottom: 12,
+          }}
+        >
+          {errorMsg}
+        </div>
+      )}
+
+      {loadState === "no-cc" && videoId && (
+        <div style={{ textAlign: "center", marginBottom: 16 }}>
+          <button
+            onClick={generateWithAI}
+            disabled={aiState === "downloading-model" || aiState === "transcribing"}
+            style={{
+              ...btnKnown,
+              opacity: aiState === "downloading-model" || aiState === "transcribing" ? 0.6 : 1,
+              margin: "0 auto",
+            }}
+          >
+            🤖 Tạo phụ đề bằng AI (miễn phí, chạy ngay trên máy bạn)
+          </button>
+          <div style={{ fontSize: 11, color: "#B0A488", marginTop: 6, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
+            Lần đầu cần tải mô hình AI (~150MB) và có thể mất vài phút tùy độ dài video, cấu hình máy và tốc độ
+            mạng. Nên dùng cho video ngắn (dưới 5 phút), trên máy tính hoặc điện thoại đời mới sẽ mượt hơn.
+          </div>
+          {(aiState === "downloading-model" || aiState === "transcribing") && (
+            <div style={{ fontSize: 12, color: "#4C7A6D", marginTop: 10 }}>{aiProgress}</div>
+          )}
+          {aiState === "error" && <div style={{ fontSize: 12, color: "#B8432F", marginTop: 10 }}>{aiProgress}</div>}
+        </div>
+      )}
+
+      {videoId && loadState === "ready" && (
+        <>
+          <div
+            style={{
+              position: "relative",
+              paddingTop: "56.25%",
+              borderRadius: 10,
+              overflow: "hidden",
+              marginBottom: 12,
+              background: "#000",
+            }}
+          >
+            <div id={playerDivId.current} style={{ position: "absolute", inset: 0 }} />
+          </div>
+
+          <div style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 12 }}>
+            {modeChip("hanzi", "Giản thể")}
+            {modeChip("hanzi_pinyin", "Giản thể + Pinyin")}
+          </div>
+
+          <div
+            style={{
+              minHeight: 90,
+              textAlign: "center",
+              padding: 16,
+              background: "#F4EEDE",
+              border: "1px solid #D8CCAE",
+              borderRadius: 10,
+            }}
+          >
+            {mode === "hanzi_pinyin" && currentText && (
+              <div style={{ fontSize: 14, color: "#4C7A6D", marginBottom: 4 }}>{pinyinText}</div>
+            )}
+            <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 24, color: "#24201B" }}>
+              {currentText || "···"}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 /* ---------------------------------------------------------
    APP
@@ -8407,12 +9106,15 @@ export default function App() {
         <TabButton icon={PenTool} label={t("tabWrite")} active={tab === "write"} onClick={() => setTab("write")} />
         <TabButton icon={BookOpen} label={t("tabBook")} active={tab === "book"} onClick={() => setTab("book")} />
         <TabButton icon={Search} label={t("tabSearch")} active={tab === "search"} onClick={() => setTab("search")} />
+        <TabButton icon={Youtube} label="Phụ đề" active={tab === "subtitle"} onClick={() => setTab("subtitle")} />
         <TabButton icon={User} label="Tài khoản" active={tab === "account"} onClick={() => setTab("account")} />
       </nav>
 
       <main style={{ maxWidth: 480, margin: "0 auto" }}>
         {tab === "account" ? (
           <AuthPanel onAuthChange={setAuthState} />
+        ) : tab === "subtitle" ? (
+          <SubtitleView />
         ) : tab === "search" ? (
           <SearchView allWords={allWords} />
         ) : level.id >= 3 && !isPaid ? (
