@@ -15,6 +15,12 @@
 
 import ytdl from "@distube/ytdl-core";
 
+const BROWSER_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
 export default async function handler(req, res) {
   const { videoId } = req.query;
   if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
@@ -23,7 +29,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
+    const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
+      requestOptions: { headers: BROWSER_HEADERS },
+    });
     const audioFormats = ytdl.filterFormats(info.formats, "audioonly");
     if (!audioFormats.length) {
       res.status(404).json({ error: "Không tìm thấy luồng âm thanh cho video này." });
@@ -32,7 +40,7 @@ export default async function handler(req, res) {
     // Chọn định dạng nhẹ nhất để tải và xử lý nhanh hơn (đủ dùng cho nhận diện giọng nói)
     const best = [...audioFormats].sort((a, b) => (a.audioBitrate || 0) - (b.audioBitrate || 0))[0];
 
-    const upstream = await fetch(best.url);
+    const upstream = await fetch(best.url, { headers: BROWSER_HEADERS });
     if (!upstream.ok || !upstream.body) {
       res.status(502).json({ error: "Không tải được luồng âm thanh từ YouTube (máy chủ YouTube từ chối yêu cầu)." });
       return;

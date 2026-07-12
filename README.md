@@ -129,7 +129,38 @@ chuyển khoản và tự bật `is_paid` qua webhook — cứ quay lại hỏi 
 
 ---
 
+## PHẦN D — Phụ đề video YouTube tiếng Trung (CC có sẵn + AI tạo phụ đề miễn phí)
+
+Tính năng ở tab **Phụ đề**: dán link YouTube nói tiếng Trung, xem 2 chế độ hiển thị
+đồng bộ theo video — chỉ giản thể, hoặc giản thể kèm pinyin.
+
+**Không cần đăng ký hay cấu hình gì thêm** — không dùng API trả phí nào ở tính năng
+này (khác với trợ lý AI ở Phần C2).
+
+### Cách hoạt động
+1. Trước tiên hệ thống tự tìm phụ đề (CC) có sẵn của chính video đó trên YouTube —
+   nhanh, miễn phí, không giới hạn độ dài video.
+2. Nếu video không có CC tiếng Trung, sẽ hiện nút **"Tạo phụ đề bằng AI"** — AI
+   (Whisper, chạy bằng WebAssembly) sẽ tự nghe và tạo phụ đề **ngay trên trình
+   duyệt của người dùng**, hoàn toàn miễn phí, không tốn gì phía bạn.
+   - Lần đầu dùng cần tải mô hình AI (~150MB), các lần sau nhanh hơn nhờ trình
+     duyệt tự lưu cache.
+   - Chỉ nên dùng cho **video ngắn (dưới 5 phút)** — vì bước lấy âm thanh vẫn cần
+     đi qua 1 hàm máy chủ nhỏ (`api/audio-proxy.js`), và gói Vercel miễn phí giới
+     hạn mỗi hàm chạy tối đa khoảng 10 giây.
+   - Trên điện thoại đời cũ, bước AI xử lý có thể chậm hoặc giật — máy tính sẽ mượt
+     hơn nhiều.
+
+### Rủi ro cần biết
+- `api/subtitles.js` và `api/audio-proxy.js` dùng các endpoint không chính thức của
+  YouTube — dùng cho mục đích học tập cá nhân. YouTube có thể thay đổi cơ chế nội bộ
+  bất kỳ lúc nào khiến tính năng cần được cập nhật lại (giống rủi ro của tính năng
+  vẽ tay tìm chữ ở Phần vẽ tay).
+
+---
+
 ## Ghi chú kỹ thuật
+
 - Icon hiển thị trên thanh tab trình duyệt (favicon) đã được tạo sẵn từ ảnh nhân vật gấu bạn
   gửi, nằm trong thư mục `public/` (`favicon.ico`, `icon-192.png`, `icon-512.png`,
   `apple-touch-icon.png`). Không cần làm gì thêm — Vite tự phục vụ các file trong `public/`

@@ -3,10 +3,10 @@ import { supabase } from "./supabaseClient.js";
 
 // Đổi 3 dòng này thành thông tin tài khoản ngân hàng thật của bạn
 const BANK_INFO = {
-  bankName: "Vietinbank",
-  accountNumber: "102874604142",
-  accountHolder: "PHAM THI HA QUYEN",
-  amount: "99,000đ",
+  bankName: "Vietcombank",
+  accountNumber: "0123456789",
+  accountHolder: "NGUYEN VAN A",
+  amount: "199,000đ",
 };
 
 export default function AuthPanel({ onAuthChange }) {
@@ -47,8 +47,10 @@ export default function AuthPanel({ onAuthChange }) {
     e.preventDefault();
     setError("");
     setLoading(true);
-    const fn = mode === "login" ? supabase.auth.signInWithPassword : supabase.auth.signUp;
-    const { error } = await fn({ email, password });
+    const { error } =
+      mode === "login"
+        ? await supabase.auth.signInWithPassword({ email, password })
+        : await supabase.auth.signUp({ email, password });
     setLoading(false);
     if (error) setError(error.message);
   };
