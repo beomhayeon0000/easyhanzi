@@ -8828,7 +8828,10 @@ function SubtitleView() {
         setCurrentText("");
         setYtState("idle");
       } else {
-        setYtError(data.error || "Không tìm thấy phụ đề tiếng Trung có sẵn cho video này.");
+        const debugStr = data.debug
+          ? ` [debug: tracks=${JSON.stringify(data.debug.tracksFound)}, attempts=${JSON.stringify(data.debug.attempts)}]`
+          : "";
+        setYtError((data.error || "Không tìm thấy phụ đề tiếng Trung có sẵn cho video này.") + debugStr);
         setYtState("error");
       }
     } catch (e) {
