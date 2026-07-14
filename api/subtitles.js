@@ -104,30 +104,45 @@ export default async function handler(req) {
 
 // Gọi API nội bộ "Innertube" của YouTube (cùng API mà trình phát/khung "Hiện bản
 // ghi" trên youtube.com dùng) để lấy danh sách track phụ đề thật, kèm sẵn baseUrl.
+// Một số video chỉ trả về phụ đề khi hỏi đúng loại "thiết bị giả lập" — nên thử
+// lần lượt vài loại phổ biến thay vì chỉ 1 loại.
 async function getTracksViaInnertube(videoId) {
-  try {
-    const res = await fetch("https://www.youtube.com/youtubei/v1/player", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        context: { client: { clientName: "ANDROID", clientVersion: "20.10.38" } },
-        videoId,
-      }),
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-    return raw
-      .filter((t) => t.baseUrl)
-      .map((t) => ({
-        lang: t.languageCode || "",
-        kind: t.kind || null,
-        isDefault: !!t.isDefault,
-        baseUrl: t.baseUrl,
-      }));
-  } catch (e) {
-    return [];
+  const clientConfigs = [
+    { clientName: "ANDROID", clientVersion: "20.10.38" },
+    { clientName: "WEB", clientVersion: "2.20240101.00.00" },
+    { clientName: "IOS", clientVersion: "20.10.4" },
+  ];
+
+  for (const client of clientConfigs) {
+    try {
+      const res = await fetch("https://www.youtube.com/youtubei/v1/player", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          context: { client },
+          videoId,
+          contentCheckOk: true,
+          racyCheckOk: true,
+        }),
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+      if (raw.length) {
+        return raw
+          .filter((t) => t.baseUrl)
+          .map((t) => ({
+            lang: t.languageCode || "",
+            kind: t.kind || null,
+            isDefault: !!t.isDefault,
+            baseUrl: t.baseUrl,
+          }));
+      }
+    } catch (e) {
+      // thử client tiếp theo
+    }
   }
+  return [];
 }
 
 async function fetchVTTFromBaseUrl(baseUrl, extra = {}) {
@@ -215,3 +230,5 @@ function parseVTT(vtt) {
   // Phụ đề tự động của YouTube hay lặp lại dòng giống hệt dòng trước — lọc bớt cho gọn
   return cues.filter((c, idx) => idx === 0 || c.text !== cues[idx - 1].text);
 }
+
+
