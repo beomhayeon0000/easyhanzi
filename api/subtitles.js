@@ -18,36 +18,45 @@ export default async function handler(req) {
     return json({ error: "videoId không hợp lệ." }, 400);
   }
 
-  // Bước 1: hỏi YouTube xem video này thực sự có những track phụ đề gốc nào
-  // (khác với danh sách "dịch tự động" mà YouTube hiển thị trên giao diện xem —
-  // những ngôn ngữ đó không phải file có sẵn, phải yêu cầu dịch riêng ở bước 2).
+  const debug = { listHostTried: [], tracksFound: [], attempts: [] };
+
+  // Bước 1: hỏi YouTube xem video này thực sự có những track phụ đề gốc nào.
+  // Thử cả 2 domain (đôi khi 1 trong 2 không ổn định) để tăng khả năng thành công.
   let tracks = [];
-  try {
-    const listUrl = `https://video.google.com/timedtext?type=list&v=${videoId}`;
-    const r = await fetch(listUrl);
-    if (r.ok) {
-      const xml = await r.text();
-      tracks = parseTrackList(xml);
+  for (const host of ["https://video.google.com", "https://www.youtube.com/api"]) {
+    debug.listHostTried.push(host);
+    try {
+      const listUrl = `${host}/timedtext?type=list&v=${videoId}`;
+      const r = await fetch(listUrl);
+      if (r.ok) {
+        const xml = await r.text();
+        const found = parseTrackList(xml);
+        if (found.length) {
+          tracks = found;
+          break;
+        }
+      }
+    } catch (e) {
+      // thử domain còn lại
     }
-  } catch (e) {
-    // bỏ qua, vẫn thử theo cách đoán ở dưới
   }
+  debug.tracksFound = tracks.map((t) => `${t.lang}${t.kind ? "(" + t.kind + ")" : ""}${t.isDefault ? "*" : ""}`);
 
   // Bước 2a: nếu có sẵn track tiếng Trung gốc (thủ công hoặc tự động), lấy trực tiếp
   const zhTrack = tracks.find((t) => /^zh/i.test(t.lang));
   if (zhTrack) {
+    debug.attempts.push(`direct:${zhTrack.lang}`);
     const cues = await fetchVTT(videoId, { lang: zhTrack.lang, kind: zhTrack.kind });
     if (cues && cues.length) {
       return json({ cues, lang: zhTrack.lang, auto: zhTrack.kind === "asr" }, 200);
     }
   }
 
-  // Bước 2b: không có track tiếng Trung gốc — nếu video có track khác (ví dụ
-  // tiếng Anh, hoặc phụ đề tự động theo giọng nói gốc), yêu cầu YouTube DỊCH
-  // track đó sang tiếng Trung giản thể (đúng như khi bạn chọn "Trung (giản
-  // thể)" trong menu CC trên YouTube — dùng tham số tlang).
+  // Bước 2b: không có track tiếng Trung gốc — yêu cầu YouTube DỊCH track khác
+  // (ví dụ tiếng Anh) sang tiếng Trung giản thể, giống khi tự chọn trong menu CC.
   if (tracks.length) {
     const base = tracks.find((t) => t.isDefault) || tracks[0];
+    debug.attempts.push(`translate:${base.lang}->zh-Hans`);
     const cues = await fetchVTT(videoId, { lang: base.lang, kind: base.kind, tlang: "zh-Hans" });
     if (cues && cues.length) {
       return json({ cues, lang: "zh-Hans", auto: true, translatedFrom: base.lang }, 200);
@@ -65,6 +74,7 @@ export default async function handler(req) {
     { lang: "zh", kind: "asr" },
   ];
   for (const cand of candidates) {
+    debug.attempts.push(`guess:${cand.lang}${cand.kind ? "(" + cand.kind + ")" : ""}`);
     const cues = await fetchVTT(videoId, cand);
     if (cues && cues.length) {
       return json({ cues, lang: cand.lang, auto: !!cand.kind }, 200);
@@ -75,6 +85,7 @@ export default async function handler(req) {
     {
       error:
         "Không tìm thấy phụ đề tiếng Trung có sẵn cho video này (video có thể tắt phụ đề, hoặc không có track gốc nào để dịch sang tiếng Trung).",
+      debug,
     },
     404
   );
@@ -150,5 +161,3 @@ function parseVTT(vtt) {
   // Phụ đề tự động của YouTube hay lặp lại dòng giống hệt dòng trước — lọc bớt cho gọn
   return cues.filter((c, idx) => idx === 0 || c.text !== cues[idx - 1].text);
 }
-
-
