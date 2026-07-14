@@ -8638,6 +8638,48 @@ function loadYouTubeIframeAPI() {
   return ytApiPromise;
 }
 
+// Phân tích bản ghi (transcript) người dùng tự copy từ khung "Hiện bản ghi" của
+// YouTube rồi dán vào — không gọi API nào cả nên không thể bị chặn. Bản ghi copy
+// từ YouTube thường có dạng mỗi dòng là 1 mốc thời gian (0:00, 1:23, 12:03...),
+// theo sau là chữ (có thể cùng dòng hoặc dòng riêng tùy trình duyệt).
+function parseYoutubeTranscriptText(raw) {
+  const tsToSec = (t) => {
+    const p = t.split(":").map(Number);
+    if (p.length === 3) return p[0] * 3600 + p[1] * 60 + p[2];
+    if (p.length === 2) return p[0] * 60 + p[1];
+    return 0;
+  };
+  const tsRe = /^(\d{1,2}:\d{2}(?::\d{2})?)\b\s*(.*)$/;
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const entries = [];
+  let i = 0;
+  while (i < lines.length) {
+    const m = lines[i].match(tsRe);
+    if (m) {
+      const start = tsToSec(m[1]);
+      let text = m[2] || "";
+      i++;
+      while (i < lines.length && !tsRe.test(lines[i])) {
+        text += (text ? " " : "") + lines[i];
+        i++;
+      }
+      if (text.trim()) entries.push({ start, text: text.trim() });
+    } else {
+      i++;
+    }
+  }
+
+  return entries.map((e, idx) => ({
+    start: e.start,
+    end: idx < entries.length - 1 ? entries[idx + 1].start : e.start + 5,
+    text: e.text,
+  }));
+}
+
 // Dịch giản thể -> tiếng Việt theo câu phụ đề hiện tại, có bộ nhớ đệm để không
 // dịch lại câu đã dịch rồi.
 const zhToViCache = new Map();
@@ -8774,6 +8816,8 @@ function SubtitleView() {
   const [videoId, setVideoId] = useState(null);
   const [ytState, setYtState] = useState("idle"); // idle | loading | error
   const [ytError, setYtError] = useState("");
+  const [showManualTranscript, setShowManualTranscript] = useState(false);
+  const [manualText, setManualText] = useState("");
   const playerRef = useRef(null);
   const playerDivId = useRef("yt-player-" + Math.random().toString(36).slice(2));
 
@@ -8829,7 +8873,7 @@ function SubtitleView() {
         setYtState("idle");
       } else {
         const debugStr = data.debug
-          ? ` [debug: tracks=${JSON.stringify(data.debug.tracksFound)}, attempts=${JSON.stringify(data.debug.attempts)}]`
+          ? ` [debug: innertube=${data.debug.innertube}, tracks=${JSON.stringify(data.debug.tracksFound)}, attempts=${JSON.stringify(data.debug.attempts)}]`
           : "";
         setYtError((data.error || "Không tìm thấy phụ đề tiếng Trung có sẵn cho video này.") + debugStr);
         setYtState("error");
@@ -8838,6 +8882,30 @@ function SubtitleView() {
       setYtError("Lỗi kết nối máy chủ.");
       setYtState("error");
     }
+  };
+
+  // Dùng bản ghi (transcript) người dùng tự copy từ YouTube dán vào — không gọi
+  // API nào, nên chắc chắn không bị chặn, dùng khi Cách 1 tự động không tìm thấy.
+  const handleUseManualTranscript = () => {
+    const entries = parseYoutubeTranscriptText(manualText);
+    if (!entries.length) {
+      setYtError("Không đọc được bản ghi vừa dán — kiểm tra lại đã copy đúng khung bản ghi của YouTube chưa.");
+      setYtState("error");
+      return;
+    }
+    const id = extractYouTubeId(ytUrlInput.trim());
+    if (!id) {
+      setYtError("Cần dán link YouTube ở ô trên trước, để hiện video kèm phụ đề.");
+      setYtState("error");
+      return;
+    }
+    setCues(entries);
+    setVideoId(id);
+    setSource("youtube");
+    setCurrentText("");
+    setYtState("idle");
+    setYtError("");
+    setShowManualTranscript(false);
   };
 
   useEffect(() => {
@@ -9119,6 +9187,50 @@ function SubtitleView() {
           </button>
         </div>
         {ytState === "error" && <div style={{ fontSize: 12, color: "#B8432F", marginTop: 8 }}>{ytError}</div>}
+
+        <div style={{ marginTop: 10 }}>
+          <button
+            onClick={() => setShowManualTranscript((v) => !v)}
+            style={{
+              fontSize: 12,
+              color: "#4C7A6D",
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              textDecoration: "underline",
+              padding: 0,
+            }}
+          >
+            {showManualTranscript ? "Ẩn cách dán bản ghi thủ công" : "Tự động không tìm thấy? Dán bản ghi (transcript) từ YouTube"}
+          </button>
+          {showManualTranscript && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ fontSize: 11, color: "#B0A488", marginBottom: 6 }}>
+                Trên YouTube: mở video → dưới khung video bấm "..." (hoặc mục mô tả) → chọn "Hiện bản ghi" (Show
+                transcript) → trong khung bản ghi hiện ra, chọn hết (Ctrl+A) → copy → dán vào ô dưới đây. Nhớ dán
+                link video ở ô trên trước để app hiện được video kèm phụ đề.
+              </div>
+              <textarea
+                value={manualText}
+                onChange={(e) => setManualText(e.target.value)}
+                placeholder="Dán bản ghi đã copy từ YouTube vào đây..."
+                rows={6}
+                style={{
+                  width: "100%",
+                  padding: 10,
+                  borderRadius: 8,
+                  border: "1px solid #D8CCAE",
+                  fontSize: 13,
+                  boxSizing: "border-box",
+                  fontFamily: "inherit",
+                }}
+              />
+              <button onClick={handleUseManualTranscript} style={{ ...btnKnown, marginTop: 8 }}>
+                Dùng bản ghi này
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Nguồn 2: tải file lên, AI tự tạo phụ đề */}
