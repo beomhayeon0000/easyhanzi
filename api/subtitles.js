@@ -18,26 +18,33 @@ export default async function handler(req) {
     return json({ error: "videoId không hợp lệ." }, 400);
   }
 
-  const debug = { listHostTried: [], tracksFound: [], attempts: [] };
+  const debug = { innertube: null, listHostTried: [], tracksFound: [], attempts: [] };
 
-  // Bước 1: hỏi YouTube xem video này thực sự có những track phụ đề gốc nào.
-  // Thử cả 2 domain (đôi khi 1 trong 2 không ổn định) để tăng khả năng thành công.
-  let tracks = [];
-  for (const host of ["https://video.google.com", "https://www.youtube.com/api"]) {
-    debug.listHostTried.push(host);
-    try {
-      const listUrl = `${host}/timedtext?type=list&v=${videoId}`;
-      const r = await fetch(listUrl);
-      if (r.ok) {
-        const xml = await r.text();
-        const found = parseTrackList(xml);
-        if (found.length) {
-          tracks = found;
-          break;
+  // Bước 0: hỏi qua "Innertube" — API nội bộ mà chính trình phát/khung "Hiện bản
+  // ghi" của YouTube dùng (khác với endpoint timedtext cũ ở dưới). Nhiều video có
+  // transcript hiện trên giao diện nhưng endpoint timedtext không thấy — thường là
+  // do 2 API này lấy dữ liệu khác nhau, nên thử cả 2 để tăng khả năng thành công.
+  let tracks = await getTracksViaInnertube(videoId);
+  debug.innertube = tracks.length ? `found ${tracks.length} track(s)` : "không có kết quả";
+
+  // Bước 1: nếu Innertube không ra gì, thử tiếp endpoint timedtext liệt kê track cũ
+  if (!tracks.length) {
+    for (const host of ["https://video.google.com", "https://www.youtube.com/api"]) {
+      debug.listHostTried.push(host);
+      try {
+        const listUrl = `${host}/timedtext?type=list&v=${videoId}`;
+        const r = await fetch(listUrl);
+        if (r.ok) {
+          const xml = await r.text();
+          const found = parseTrackList(xml);
+          if (found.length) {
+            tracks = found;
+            break;
+          }
         }
+      } catch (e) {
+        // thử domain còn lại
       }
-    } catch (e) {
-      // thử domain còn lại
     }
   }
   debug.tracksFound = tracks.map((t) => `${t.lang}${t.kind ? "(" + t.kind + ")" : ""}${t.isDefault ? "*" : ""}`);
@@ -46,7 +53,9 @@ export default async function handler(req) {
   const zhTrack = tracks.find((t) => /^zh/i.test(t.lang));
   if (zhTrack) {
     debug.attempts.push(`direct:${zhTrack.lang}`);
-    const cues = await fetchVTT(videoId, { lang: zhTrack.lang, kind: zhTrack.kind });
+    const cues = zhTrack.baseUrl
+      ? await fetchVTTFromBaseUrl(zhTrack.baseUrl)
+      : await fetchVTT(videoId, { lang: zhTrack.lang, kind: zhTrack.kind });
     if (cues && cues.length) {
       return json({ cues, lang: zhTrack.lang, auto: zhTrack.kind === "asr" }, 200);
     }
@@ -57,13 +66,15 @@ export default async function handler(req) {
   if (tracks.length) {
     const base = tracks.find((t) => t.isDefault) || tracks[0];
     debug.attempts.push(`translate:${base.lang}->zh-Hans`);
-    const cues = await fetchVTT(videoId, { lang: base.lang, kind: base.kind, tlang: "zh-Hans" });
+    const cues = base.baseUrl
+      ? await fetchVTTFromBaseUrl(base.baseUrl, { tlang: "zh-Hans" })
+      : await fetchVTT(videoId, { lang: base.lang, kind: base.kind, tlang: "zh-Hans" });
     if (cues && cues.length) {
       return json({ cues, lang: "zh-Hans", auto: true, translatedFrom: base.lang }, 200);
     }
   }
 
-  // Bước 3 (dự phòng): thử đoán trực tiếp như cũ, phòng trường hợp bước 1 thất bại
+  // Bước 3 (dự phòng): thử đoán trực tiếp như cũ, phòng trường hợp mọi thứ ở trên thất bại
   const candidates = [
     { lang: "zh-Hans" },
     { lang: "zh-CN" },
@@ -89,6 +100,49 @@ export default async function handler(req) {
     },
     404
   );
+}
+
+// Gọi API nội bộ "Innertube" của YouTube (cùng API mà trình phát/khung "Hiện bản
+// ghi" trên youtube.com dùng) để lấy danh sách track phụ đề thật, kèm sẵn baseUrl.
+async function getTracksViaInnertube(videoId) {
+  try {
+    const res = await fetch("https://www.youtube.com/youtubei/v1/player", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        context: { client: { clientName: "ANDROID", clientVersion: "20.10.38" } },
+        videoId,
+      }),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    return raw
+      .filter((t) => t.baseUrl)
+      .map((t) => ({
+        lang: t.languageCode || "",
+        kind: t.kind || null,
+        isDefault: !!t.isDefault,
+        baseUrl: t.baseUrl,
+      }));
+  } catch (e) {
+    return [];
+  }
+}
+
+async function fetchVTTFromBaseUrl(baseUrl, extra = {}) {
+  try {
+    const sep = baseUrl.includes("?") ? "&" : "?";
+    const params = new URLSearchParams({ fmt: "vtt", ...extra });
+    const url = `${baseUrl}${sep}${params.toString()}`;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const text = await r.text();
+    if (!text || !text.includes("-->")) return null;
+    return parseVTT(text);
+  } catch (e) {
+    return null;
+  }
 }
 
 async function fetchVTT(videoId, { lang, kind, tlang }) {
