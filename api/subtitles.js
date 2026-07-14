@@ -18,8 +18,43 @@ export default async function handler(req) {
     return json({ error: "videoId không hợp lệ." }, 400);
   }
 
-  // Thử lần lượt: phụ đề thủ công tiếng Trung giản thể/phồn thể, rồi tới phụ đề
-  // tự động (asr) nếu không có bản thủ công.
+  // Bước 1: hỏi YouTube xem video này thực sự có những track phụ đề gốc nào
+  // (khác với danh sách "dịch tự động" mà YouTube hiển thị trên giao diện xem —
+  // những ngôn ngữ đó không phải file có sẵn, phải yêu cầu dịch riêng ở bước 2).
+  let tracks = [];
+  try {
+    const listUrl = `https://video.google.com/timedtext?type=list&v=${videoId}`;
+    const r = await fetch(listUrl);
+    if (r.ok) {
+      const xml = await r.text();
+      tracks = parseTrackList(xml);
+    }
+  } catch (e) {
+    // bỏ qua, vẫn thử theo cách đoán ở dưới
+  }
+
+  // Bước 2a: nếu có sẵn track tiếng Trung gốc (thủ công hoặc tự động), lấy trực tiếp
+  const zhTrack = tracks.find((t) => /^zh/i.test(t.lang));
+  if (zhTrack) {
+    const cues = await fetchVTT(videoId, { lang: zhTrack.lang, kind: zhTrack.kind });
+    if (cues && cues.length) {
+      return json({ cues, lang: zhTrack.lang, auto: zhTrack.kind === "asr" }, 200);
+    }
+  }
+
+  // Bước 2b: không có track tiếng Trung gốc — nếu video có track khác (ví dụ
+  // tiếng Anh, hoặc phụ đề tự động theo giọng nói gốc), yêu cầu YouTube DỊCH
+  // track đó sang tiếng Trung giản thể (đúng như khi bạn chọn "Trung (giản
+  // thể)" trong menu CC trên YouTube — dùng tham số tlang).
+  if (tracks.length) {
+    const base = tracks.find((t) => t.isDefault) || tracks[0];
+    const cues = await fetchVTT(videoId, { lang: base.lang, kind: base.kind, tlang: "zh-Hans" });
+    if (cues && cues.length) {
+      return json({ cues, lang: "zh-Hans", auto: true, translatedFrom: base.lang }, 200);
+    }
+  }
+
+  // Bước 3 (dự phòng): thử đoán trực tiếp như cũ, phòng trường hợp bước 1 thất bại
   const candidates = [
     { lang: "zh-Hans" },
     { lang: "zh-CN" },
@@ -29,29 +64,53 @@ export default async function handler(req) {
     { lang: "zh-CN", kind: "asr" },
     { lang: "zh", kind: "asr" },
   ];
-
   for (const cand of candidates) {
-    try {
-      const params = new URLSearchParams({ v: videoId, lang: cand.lang, fmt: "vtt" });
-      if (cand.kind) params.set("kind", cand.kind);
-      const url = `https://www.youtube.com/api/timedtext?${params.toString()}`;
-      const r = await fetch(url);
-      if (!r.ok) continue;
-      const text = await r.text();
-      if (!text || !text.includes("-->")) continue;
-      const cues = parseVTT(text);
-      if (cues.length) {
-        return json({ cues, lang: cand.lang, auto: !!cand.kind }, 200);
-      }
-    } catch (e) {
-      // thử phương án tiếp theo
+    const cues = await fetchVTT(videoId, cand);
+    if (cues && cues.length) {
+      return json({ cues, lang: cand.lang, auto: !!cand.kind }, 200);
     }
   }
 
   return json(
-    { error: "Không tìm thấy phụ đề tiếng Trung có sẵn cho video này (video có thể không có CC tiếng Trung)." },
+    {
+      error:
+        "Không tìm thấy phụ đề tiếng Trung có sẵn cho video này (video có thể tắt phụ đề, hoặc không có track gốc nào để dịch sang tiếng Trung).",
+    },
     404
   );
+}
+
+async function fetchVTT(videoId, { lang, kind, tlang }) {
+  try {
+    const params = new URLSearchParams({ v: videoId, lang, fmt: "vtt" });
+    if (kind) params.set("kind", kind);
+    if (tlang) params.set("tlang", tlang);
+    const url = `https://www.youtube.com/api/timedtext?${params.toString()}`;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const text = await r.text();
+    if (!text || !text.includes("-->")) return null;
+    return parseVTT(text);
+  } catch (e) {
+    return null;
+  }
+}
+
+// Phân tích XML danh sách track phụ đề thật sự có sẵn của video
+// (dạng <track lang_code="en" kind="asr" lang_default="true"/>...)
+function parseTrackList(xml) {
+  const tracks = [];
+  const re = /<track\b[^>]*>/g;
+  let m;
+  while ((m = re.exec(xml))) {
+    const tag = m[0];
+    const lang = (tag.match(/lang_code="([^"]*)"/) || [])[1];
+    if (!lang) continue;
+    const kind = (tag.match(/kind="([^"]*)"/) || [])[1] || null;
+    const isDefault = /lang_default="true"/.test(tag);
+    tracks.push({ lang, kind, isDefault });
+  }
+  return tracks;
 }
 
 function json(obj, status) {
