@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef, useContext, createContext } from "react";
 import { pinyin } from "pinyin-pro";
-import { Check, X, ChevronLeft, ChevronRight, BookOpen, Layers, ClipboardList, RefreshCw, Lock, Volume2, PenTool, Search, Shuffle, User, MessageCircle, Youtube, Captions } from "lucide-react";
+import { Check, X, ChevronLeft, ChevronRight, BookOpen, Layers, ClipboardList, RefreshCw, Lock, Volume2, PenTool, Search, Shuffle, User, MessageCircle, Youtube, Captions, Gamepad2, ExternalLink } from "lucide-react";
 import AuthPanel from "./AuthPanel.jsx";
 
 /* ---------------------------------------------------------
@@ -8618,18 +8618,178 @@ async function decodeAudioFromFile(file) {
   return decodeArrayBufferToWhisperInput(buf);
 }
 
+function extractYouTubeId(url) {
+  const m = url.match(/^.*(?:youtu\.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/);
+  return m && m[1] && m[1].length === 11 ? m[1] : null;
+}
+
+let ytApiPromise = null;
+function loadYouTubeIframeAPI() {
+  if (typeof window === "undefined") return Promise.reject(new Error("no window"));
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+  if (ytApiPromise) return ytApiPromise;
+  ytApiPromise = new Promise((resolve, reject) => {
+    window.onYouTubeIframeAPIReady = () => resolve(window.YT);
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    tag.onerror = () => reject(new Error("Không tải được YouTube player API"));
+    document.body.appendChild(tag);
+  });
+  return ytApiPromise;
+}
+
+// Dịch giản thể -> tiếng Việt theo câu phụ đề hiện tại, có bộ nhớ đệm để không
+// dịch lại câu đã dịch rồi.
+const zhToViCache = new Map();
+async function translateZhToVi(text) {
+  if (!text) return "";
+  if (zhToViCache.has(text)) return zhToViCache.get(text);
+  try {
+    const res = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=zh-CN|vi`);
+    const data = await res.json();
+    const translated = data && data.responseData && data.responseData.translatedText;
+    if (translated) {
+      zhToViCache.set(text, translated);
+      return translated;
+    }
+  } catch (e) {
+    /* im lặng, để trống nếu dịch lỗi */
+  }
+  return "";
+}
+
+const AI_MODEL_ID = "Xenova/whisper-large-v3-turbo";
+
+// ---- Đọc phụ đề cứng (đã in sẵn vào hình ảnh video) bằng OCR ----
+// Dùng PaddleOCR bản chạy trong trình duyệt (@paddlejs-models/ocr) — không cần
+// server riêng, giống cách Whisper chạy ở Cách 2. Chỉ nên dùng khi video không
+// có lời thoại rõ ràng để AI nghe (ví dụ video nhạc chỉ có lyric in sẵn).
+let ocrInitPromise = null;
+async function getOcrEngine() {
+  if (!ocrInitPromise) {
+    ocrInitPromise = (async () => {
+      const ocr = await import("@paddlejs-models/ocr");
+      await ocr.init();
+      return ocr;
+    })().catch((e) => {
+      ocrInitPromise = null;
+      throw e;
+    });
+  }
+  return ocrInitPromise;
+}
+
+function seekVideoTo(video, t) {
+  return new Promise((resolve) => {
+    const onSeeked = () => {
+      video.removeEventListener("seeked", onSeeked);
+      resolve();
+    };
+    video.addEventListener("seeked", onSeeked);
+    video.currentTime = t;
+  });
+}
+
+// cropPercent: phụ đề nằm trong khoảng bao nhiêu % chiều cao tính từ đáy khung hình
+async function extractHardsubCues(file, cropPercent, onProgress) {
+  const ocr = await getOcrEngine();
+
+  const video = document.createElement("video");
+  video.muted = true;
+  video.src = URL.createObjectURL(file);
+  await new Promise((resolve, reject) => {
+    video.onloadedmetadata = resolve;
+    video.onerror = () => reject(new Error("Không đọc được file video."));
+  });
+
+  const duration = video.duration;
+  const interval = 1; // giây giữa mỗi lần chụp khung hình — cân bằng giữa độ chính xác thời gian và tốc độ xử lý
+  const cropHeight = Math.max(20, Math.round(video.videoHeight * (cropPercent / 100)));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth;
+  canvas.height = cropHeight;
+  const ctx = canvas.getContext("2d");
+
+  const cues = [];
+  let current = null;
+  const totalSteps = Math.max(1, Math.ceil(duration / interval));
+
+  for (let i = 0; i <= totalSteps; i++) {
+    const t = Math.min(i * interval, duration);
+    await seekVideoTo(video, t);
+    ctx.drawImage(
+      video,
+      0,
+      video.videoHeight - cropHeight,
+      video.videoWidth,
+      cropHeight,
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+
+    let text = "";
+    try {
+      const res = await ocr.recognize(canvas);
+      const raw = res && res.text;
+      text = (Array.isArray(raw) ? raw.join("") : raw || "").trim();
+    } catch (e) {
+      // bỏ qua khung hình lỗi, coi như không có chữ
+    }
+
+    if (text) {
+      if (current && current.text === text) {
+        current.end = t;
+      } else {
+        if (current) cues.push(current);
+        current = { start: t, end: t + interval, text };
+      }
+    } else if (current) {
+      cues.push(current);
+      current = null;
+    }
+
+    onProgress && onProgress(i + 1, totalSteps + 1);
+    // Nhường luồng chính 1 nhịp giữa các khung hình để trang không bị đơ
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  if (current) cues.push(current);
+
+  URL.revokeObjectURL(video.src);
+  return cues;
+}
+
 function SubtitleView() {
   const [cues, setCues] = useState([]);
+  const [source, setSource] = useState(null); // "youtube" | "file" | null
+  const [mode, setMode] = useState("hanzi"); // hanzi | hanzi_pinyin | hanzi_pinyin_vi
+  const [currentText, setCurrentText] = useState("");
+  const [speed, setSpeed] = useState(1);
+  const [viText, setViText] = useState("");
+
+  // Nguồn 1: link YouTube có sẵn phụ đề (CC)
+  const [ytUrlInput, setYtUrlInput] = useState("");
+  const [videoId, setVideoId] = useState(null);
+  const [ytState, setYtState] = useState("idle"); // idle | loading | error
+  const [ytError, setYtError] = useState("");
+  const playerRef = useRef(null);
+  const playerDivId = useRef("yt-player-" + Math.random().toString(36).slice(2));
+
+  // Nguồn 2: tải file lên, AI tự tạo phụ đề
   const [mediaUrl, setMediaUrl] = useState(null);
   const [mediaType, setMediaType] = useState(null); // "video" | "audio"
-  const [mode, setMode] = useState("hanzi"); // hanzi | hanzi_pinyin
-  const [currentText, setCurrentText] = useState("");
-  const [aiState, setAiState] = useState("idle"); // idle | loading-model | transcribing | done | error
+  const [aiState, setAiState] = useState("idle"); // idle | loading-model | transcribing | error
   const [aiProgress, setAiProgress] = useState("");
+  const [ocrState, setOcrState] = useState("idle"); // idle | running | error
+  const [ocrProgress, setOcrProgress] = useState("");
+  const [cropPercent, setCropPercent] = useState(20);
   const mediaRef = useRef(null);
-  const rafRef = useRef(null);
-  const workerRef = useRef(null);
   const mediaUrlRef = useRef(null);
+  const workerRef = useRef(null);
+
+  const rafRef = useRef(null);
 
   const getWorker = () => {
     if (!workerRef.current) {
@@ -8648,18 +8808,85 @@ function SubtitleView() {
     };
   }, []);
 
+  // ---- Nguồn 1: lấy CC có sẵn từ YouTube ----
+  const loadYoutubeCC = async () => {
+    const id = extractYouTubeId(ytUrlInput.trim());
+    if (!id) {
+      setYtError("Link YouTube không hợp lệ.");
+      setYtState("error");
+      return;
+    }
+    setYtState("loading");
+    setYtError("");
+    try {
+      const res = await fetch(`/api/subtitles?videoId=${id}`);
+      const data = await res.json();
+      if (res.ok && data.cues && data.cues.length) {
+        setCues(data.cues);
+        setVideoId(id);
+        setSource("youtube");
+        setCurrentText("");
+        setYtState("idle");
+      } else {
+        setYtError(data.error || "Không tìm thấy phụ đề tiếng Trung có sẵn cho video này.");
+        setYtState("error");
+      }
+    } catch (e) {
+      setYtError("Lỗi kết nối máy chủ.");
+      setYtState("error");
+    }
+  };
+
+  useEffect(() => {
+    if (source !== "youtube" || !videoId) return;
+    let cancelled = false;
+    loadYouTubeIframeAPI().then((YT) => {
+      if (cancelled) return;
+      if (playerRef.current && playerRef.current.loadVideoById) {
+        playerRef.current.loadVideoById(videoId);
+        return;
+      }
+      playerRef.current = new YT.Player(playerDivId.current, {
+        height: "100%",
+        width: "100%",
+        videoId,
+        playerVars: { rel: 0 },
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [source, videoId]);
+
+  // Áp dụng tốc độ phát mỗi khi người dùng đổi tốc độ, hoặc mỗi khi có
+  // video/audio mới được tải — dùng chung cho cả 2 nguồn (YouTube / file).
+  useEffect(() => {
+    if (source === "youtube" && playerRef.current && playerRef.current.setPlaybackRate) {
+      try {
+        playerRef.current.setPlaybackRate(speed);
+      } catch (e) {
+        /* player chưa sẵn sàng, bỏ qua */
+      }
+    }
+    if (source === "file" && mediaRef.current) {
+      mediaRef.current.playbackRate = speed;
+    }
+  }, [speed, source, videoId, mediaUrl]);
+
+  // ---- Nguồn 2: tải file lên, AI tự tạo phụ đề ----
   const handleFile = async (file) => {
     if (!file) return;
     setCues([]);
     setCurrentText("");
     setAiState("loading-model");
-    setAiProgress("Đang tải mô hình AI (khoảng 40-80MB tùy thiết bị, chỉ cần tải 1 lần)...");
+    setAiProgress("Đang tải mô hình AI độ chính xác cao (có thể vài trăm MB - hơn 1GB, chỉ cần tải 1 lần)...");
 
     const url = URL.createObjectURL(file);
     if (mediaUrlRef.current) URL.revokeObjectURL(mediaUrlRef.current);
     mediaUrlRef.current = url;
     setMediaUrl(url);
     setMediaType(file.type.startsWith("video") ? "video" : "audio");
+    setSource("file");
 
     try {
       const audioData = await decodeAudioFromFile(file);
@@ -8673,7 +8900,7 @@ function SubtitleView() {
             }
           } else if (type === "device") {
             setAiState("transcribing");
-            setAiProgress(payload === "webgpu" ? "Đang xử lý bằng GPU (nhanh hơn)..." : "Đang xử lý bằng CPU...");
+            setAiProgress(payload === "webgpu" ? "Đang xử lý bằng GPU (nhanh hơn)..." : "Đang xử lý bằng CPU (có thể khá lâu với mô hình độ chính xác cao)...");
           } else if (type === "chunkProgress") {
             setAiProgress(`Đang xử lý đoạn ${payload.index}/${payload.total}...`);
           } else if (type === "done") {
@@ -8685,12 +8912,12 @@ function SubtitleView() {
           }
         };
         worker.addEventListener("message", handleMessage);
-        worker.postMessage({ type: "transcribe", audioData }, [audioData.buffer]);
+        worker.postMessage({ type: "transcribe", audioData, modelId: AI_MODEL_ID }, [audioData.buffer]);
       });
 
       if (!resultCues.length) throw new Error("AI không nhận ra lời thoại tiếng Trung nào trong file này.");
       setCues(resultCues);
-      setAiState("done");
+      setAiState("idle");
       setAiProgress("");
     } catch (e) {
       setAiState("error");
@@ -8698,12 +8925,57 @@ function SubtitleView() {
     }
   };
 
+  // ---- Nguồn 3: đọc phụ đề cứng (in sẵn trong hình) bằng OCR ----
+  const handleFileOCR = async (file) => {
+    if (!file) return;
+    setCues([]);
+    setCurrentText("");
+    setOcrState("running");
+    setOcrProgress("Đang tải mô hình OCR (chỉ cần tải 1 lần)...");
+
+    const url = URL.createObjectURL(file);
+    if (mediaUrlRef.current) URL.revokeObjectURL(mediaUrlRef.current);
+    mediaUrlRef.current = url;
+    setMediaUrl(url);
+    setMediaType("video");
+    setSource("file");
+
+    try {
+      const resultCues = await extractHardsubCues(file, cropPercent, (i, total) => {
+        setOcrProgress(`Đang đọc khung hình ${i}/${total}...`);
+      });
+      if (!resultCues.length) {
+        throw new Error("Không đọc được chữ nào trong vùng đã chọn — thử chỉnh lại % vùng phụ đề rồi thử lại.");
+      }
+      setCues(resultCues);
+      setOcrState("idle");
+      setOcrProgress("");
+    } catch (e) {
+      setOcrState("error");
+      setOcrProgress((e && e.message) || "Có lỗi khi đọc phụ đề cứng, thử lại hoặc dùng file khác.");
+    }
+  };
+
+  // ---- Đồng bộ phụ đề theo thời gian phát, dùng chung cho cả 2 nguồn ----
+  const getCurrentTime = () => {
+    if (source === "youtube" && playerRef.current && playerRef.current.getCurrentTime) {
+      try {
+        return playerRef.current.getCurrentTime();
+      } catch (e) {
+        return null;
+      }
+    }
+    if (source === "file" && mediaRef.current) {
+      return mediaRef.current.currentTime;
+    }
+    return null;
+  };
+
   useEffect(() => {
-    if (!mediaUrl || !cues.length) return;
+    if (!source || !cues.length) return;
     const loop = () => {
-      const el = mediaRef.current;
-      if (el) {
-        const t = el.currentTime;
+      const t = getCurrentTime();
+      if (t != null) {
         const cue = cues.find((c) => t >= c.start && t <= c.end);
         setCurrentText(cue ? cue.text : "");
       }
@@ -8711,7 +8983,8 @@ function SubtitleView() {
     };
     rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [mediaUrl, cues]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source, cues]);
 
   const pinyinText = useMemo(() => {
     if (!currentText) return "";
@@ -8721,6 +8994,20 @@ function SubtitleView() {
       return "";
     }
   }, [currentText]);
+
+  useEffect(() => {
+    if (mode !== "hanzi_pinyin_vi" || !currentText) {
+      setViText("");
+      return;
+    }
+    let cancelled = false;
+    translateZhToVi(currentText).then((t) => {
+      if (!cancelled) setViText(t);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentText, mode]);
 
   const modeChip = (id, label) => (
     <button
@@ -8739,24 +9026,125 @@ function SubtitleView() {
     </button>
   );
 
-  const busy = aiState === "loading-model" || aiState === "transcribing";
+  const ytBusy = ytState === "loading";
+  const aiBusy = aiState === "loading-model" || aiState === "transcribing";
 
   return (
     <div>
-      <div style={{ textAlign: "center", marginBottom: 16 }}>
+      {/* Kênh YouTube gợi ý có phụ đề (CC) tiếng Trung */}
+      <div
+        style={{
+          border: "1px solid #D8CCAE",
+          background: "#F4EEDE",
+          borderRadius: 10,
+          padding: 14,
+          marginBottom: 14,
+          textAlign: "left",
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#24201B", marginBottom: 10 }}>
+          Kênh YouTube gợi ý (thường có sẵn phụ đề CC)
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {[
+            { group: "Phim", name: "阅文短剧", url: "https://m.youtube.com/@YuewenDrama?ra=m" },
+            { group: "Đời sống", name: "@DANLIAOFreeToLearnChinese", url: "https://m.youtube.com/@DANLIAOFreeToLearnChinese?ra=m" },
+            { group: "Văn hóa xã hội", name: "@ChinaZone-Documentary", url: "https://m.youtube.com/@ChinaZone-Documentary?ra=m" },
+          ].map((ch) => (
+            <a
+              key={ch.url}
+              href={ch.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                padding: "8px 10px",
+                borderRadius: 8,
+                background: "#FBF7EC",
+                border: "1px solid #E3D8BB",
+                textDecoration: "none",
+                color: "#24201B",
+              }}
+            >
+              <span>
+                <span style={{ fontSize: 11, color: "#B08D3F", marginRight: 6 }}>{ch.group}</span>
+                <span style={{ fontSize: 13 }}>{ch.name}</span>
+              </span>
+              <ExternalLink size={14} color="#8A8072" />
+            </a>
+          ))}
+        </div>
+        <div style={{ fontSize: 11, color: "#B0A488", marginTop: 8 }}>
+          Bấm để mở kênh, chọn 1 video rồi copy link dán vào ô "Cách 1" bên dưới.
+        </div>
+      </div>
+
+      {/* Nguồn 1: link YouTube có sẵn phụ đề */}
+      <div
+        style={{
+          border: "1px solid #D8CCAE",
+          background: "#F4EEDE",
+          borderRadius: 10,
+          padding: 14,
+          marginBottom: 14,
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#24201B", marginBottom: 8 }}>
+          Cách 1 — Video YouTube đã có sẵn phụ đề (CC)
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={ytUrlInput}
+            onChange={(e) => setYtUrlInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && loadYoutubeCC()}
+            placeholder="Dán link YouTube tiếng Trung..."
+            disabled={ytBusy}
+            style={{
+              flex: 1,
+              padding: "10px 12px",
+              borderRadius: 8,
+              border: "1px solid #D8CCAE",
+              background: "#FBF7EC",
+              fontSize: 14,
+              boxSizing: "border-box",
+            }}
+          />
+          <button onClick={loadYoutubeCC} disabled={ytBusy} style={{ ...btnKnown, opacity: ytBusy ? 0.6 : 1 }}>
+            {ytBusy ? "Đang tải..." : "Tải phụ đề"}
+          </button>
+        </div>
+        {ytState === "error" && <div style={{ fontSize: 12, color: "#B8432F", marginTop: 8 }}>{ytError}</div>}
+      </div>
+
+      {/* Nguồn 2: tải file lên, AI tự tạo phụ đề */}
+      <div
+        style={{
+          border: "1px solid #D8CCAE",
+          background: "#F4EEDE",
+          borderRadius: 10,
+          padding: 14,
+          marginBottom: 16,
+          textAlign: "center",
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#24201B", marginBottom: 8, textAlign: "left" }}>
+          Cách 2 — Video/audio chưa có phụ đề: để AI tự tạo (độ chính xác cao)
+        </div>
         <label
           style={{
             ...btnKnown,
             display: "inline-flex",
-            cursor: busy ? "default" : "pointer",
-            opacity: busy ? 0.6 : 1,
+            cursor: aiBusy ? "default" : "pointer",
+            opacity: aiBusy ? 0.6 : 1,
           }}
         >
           📁 Chọn file âm thanh/video tiếng Trung
           <input
             type="file"
             accept="audio/*,video/*"
-            disabled={busy}
+            disabled={aiBusy}
             onChange={(e) => {
               const file = e.target.files && e.target.files[0];
               if (file) handleFile(file);
@@ -8766,33 +9154,118 @@ function SubtitleView() {
           />
         </label>
         <div style={{ fontSize: 11, color: "#B0A488", marginTop: 8, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
-          Xử lý AI hoàn toàn trên máy bạn — không tải gì lên server, không cần đăng nhập. Lần đầu cần tải mô hình
-          AI, có thể mất vài phút tùy độ dài file. Nên dùng file dưới 10-15 phút; máy có card đồ họa rời sẽ nhanh
-          hơn nhiều.
+          Xử lý AI hoàn toàn trên máy bạn — không tải gì lên server, không cần đăng nhập. Dùng mô hình độ chính xác
+          cao nên lần đầu cần tải file khá lớn (vài trăm MB - hơn 1GB) và xử lý có thể mất nhiều phút, nhanh hơn
+          nhiều nếu máy có card đồ họa rời hỗ trợ WebGPU. Nên dùng file dưới 10-15 phút.
         </div>
-        {busy && <div style={{ fontSize: 12, color: "#4C7A6D", marginTop: 10 }}>{aiProgress}</div>}
+        {aiBusy && <div style={{ fontSize: 12, color: "#4C7A6D", marginTop: 10 }}>{aiProgress}</div>}
         {aiState === "error" && <div style={{ fontSize: 12, color: "#B8432F", marginTop: 10 }}>{aiProgress}</div>}
       </div>
 
-      {mediaUrl && (
+      {/* Nguồn 3: đọc phụ đề cứng (in sẵn trong hình) bằng OCR */}
+      <div
+        style={{
+          border: "1px solid #D8CCAE",
+          background: "#F4EEDE",
+          borderRadius: 10,
+          padding: 14,
+          marginBottom: 16,
+          textAlign: "center",
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#24201B", marginBottom: 8, textAlign: "left" }}>
+          Cách 3 — Video có phụ đề "cứng" in sẵn trong hình (không có lời thoại rõ để AI nghe)
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "center", marginBottom: 10 }}>
+          <label style={{ fontSize: 12, color: "#6B5F52" }}>Vùng phụ đề nằm ở</label>
+          <input
+            type="number"
+            min={10}
+            max={50}
+            value={cropPercent}
+            onChange={(e) => setCropPercent(Number(e.target.value) || 20)}
+            disabled={ocrState === "running"}
+            style={{ width: 56, padding: 6, borderRadius: 6, border: "1px solid #D8CCAE", textAlign: "center" }}
+          />
+          <label style={{ fontSize: 12, color: "#6B5F52" }}>% phía dưới khung hình</label>
+        </div>
+        <label
+          style={{
+            ...btnKnown,
+            display: "inline-flex",
+            cursor: ocrState === "running" ? "default" : "pointer",
+            opacity: ocrState === "running" ? 0.6 : 1,
+          }}
+        >
+          🔤 Chọn video có phụ đề cứng
+          <input
+            type="file"
+            accept="video/*"
+            disabled={ocrState === "running"}
+            onChange={(e) => {
+              const file = e.target.files && e.target.files[0];
+              if (file) handleFileOCR(file);
+              e.target.value = "";
+            }}
+            style={{ display: "none" }}
+          />
+        </label>
+        <div style={{ fontSize: 11, color: "#B0A488", marginTop: 8, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
+          Dùng khi video không có lời thoại rõ để AI nghe (ví dụ video nhạc chỉ có lyric in sẵn trong hình). Chạy
+          hoàn toàn trên máy bạn qua OCR (đọc chữ trong ảnh), không cần server. Nên dùng file dưới 10 phút — xử lý
+          theo từng khung hình nên khá chậm. Nếu không đọc đúng chữ, thử chỉnh lại % vùng phụ đề cho khớp video.
+        </div>
+        {ocrState === "running" && <div style={{ fontSize: 12, color: "#4C7A6D", marginTop: 10 }}>{ocrProgress}</div>}
+        {ocrState === "error" && <div style={{ fontSize: 12, color: "#B8432F", marginTop: 10 }}>{ocrProgress}</div>}
+      </div>
+
+      {source && (
         <>
           <div style={{ borderRadius: 10, overflow: "hidden", marginBottom: 12, background: "#000" }}>
-            {mediaType === "video" ? (
+            {source === "youtube" && (
+              <div style={{ position: "relative", paddingTop: "56.25%" }}>
+                <div id={playerDivId.current} style={{ position: "absolute", inset: 0 }} />
+              </div>
+            )}
+            {source === "file" && mediaType === "video" && (
               <video ref={mediaRef} src={mediaUrl} controls style={{ width: "100%", display: "block" }} />
-            ) : (
+            )}
+            {source === "file" && mediaType === "audio" && (
               <audio ref={mediaRef} src={mediaUrl} controls style={{ width: "100%" }} />
             )}
           </div>
 
+          <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "center", marginBottom: 14, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12, color: "#6B5F52", marginRight: 2 }}>Tốc độ:</span>
+            {[0.5, 0.75, 1, 1.25, 1.5].map((s) => (
+              <button
+                key={s}
+                onClick={() => setSpeed(s)}
+                style={{
+                  padding: "4px 10px",
+                  borderRadius: 999,
+                  fontSize: 12,
+                  cursor: "pointer",
+                  border: `1px solid ${speed === s ? "#B8432F" : "#D8CCAE"}`,
+                  background: speed === s ? "#B8432F" : "transparent",
+                  color: speed === s ? "#F4EEDE" : "#6B5F52",
+                }}
+              >
+                {s}x
+              </button>
+            ))}
+          </div>
+
           {cues.length > 0 && (
             <>
-              <div style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 12 }}>
+              <div style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 12, flexWrap: "wrap" }}>
                 {modeChip("hanzi", "Giản thể")}
                 {modeChip("hanzi_pinyin", "Giản thể + Pinyin")}
+                {modeChip("hanzi_pinyin_vi", "Giản thể + Pinyin + Việt")}
               </div>
               <div
                 style={{
-                  minHeight: 90,
+                  minHeight: 110,
                   textAlign: "center",
                   padding: 16,
                   background: "#F4EEDE",
@@ -8800,17 +9273,66 @@ function SubtitleView() {
                   borderRadius: 10,
                 }}
               >
-                {mode === "hanzi_pinyin" && currentText && (
+                {(mode === "hanzi_pinyin" || mode === "hanzi_pinyin_vi") && currentText && (
                   <div style={{ fontSize: 14, color: "#4C7A6D", marginBottom: 4 }}>{pinyinText}</div>
                 )}
                 <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 24, color: "#24201B" }}>
                   {currentText || "···"}
                 </div>
+                {mode === "hanzi_pinyin_vi" && currentText && (
+                  <div style={{ fontSize: 14, color: "#8A8072", marginTop: 6, fontStyle: "italic" }}>
+                    {viText || "Đang dịch..."}
+                  </div>
+                )}
               </div>
             </>
           )}
         </>
       )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   GAME
+--------------------------------------------------------- */
+function GameView() {
+  return (
+    <div style={{ textAlign: "center", padding: "20px 0" }}>
+      <div
+        style={{
+          border: "1px solid #D8CCAE",
+          background: "#F4EEDE",
+          borderRadius: 14,
+          padding: 28,
+          maxWidth: 380,
+          margin: "0 auto",
+        }}
+      >
+        <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 40, color: "#B8432F", marginBottom: 8 }}>
+          大盗贼
+        </div>
+        <div style={{ fontSize: 18, fontWeight: 700, color: "#24201B", marginBottom: 6 }}>Đại Đạo Chích</div>
+        <div style={{ fontSize: 13, color: "#6B5F52", marginBottom: 20, lineHeight: 1.6 }}>
+          Game nhỏ luyện từ vựng tiếng Trung theo phong cách hài hước — nhập vai tên trộm, thực hiện đúng hành
+          động bằng cách chọn đúng từ tiếng Trung được yêu cầu.
+        </div>
+        <a
+          href="/games/dai-dao-chich.html"
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            ...btnKnown,
+            display: "inline-flex",
+            textDecoration: "none",
+          }}
+        >
+          <Gamepad2 size={18} /> Chơi ngay <ExternalLink size={14} />
+        </a>
+        <div style={{ fontSize: 11, color: "#B0A488", marginTop: 12 }}>
+          Game mở ở tab mới, chơi tốt nhất trên điện thoại (cầm ngang màn hình).
+        </div>
+      </div>
     </div>
   );
 }
@@ -8990,6 +9512,7 @@ export default function App() {
         <TabButton icon={BookOpen} label={t("tabBook")} active={tab === "book"} onClick={() => setTab("book")} />
         <TabButton icon={Search} label={t("tabSearch")} active={tab === "search"} onClick={() => setTab("search")} />
         <TabButton icon={Captions} label="Phụ đề" active={tab === "subtitle"} onClick={() => setTab("subtitle")} />
+        <TabButton icon={Gamepad2} label="Game" active={tab === "game"} onClick={() => setTab("game")} />
         <TabButton icon={User} label="Tài khoản" active={tab === "account"} onClick={() => setTab("account")} />
       </nav>
 
@@ -8998,6 +9521,8 @@ export default function App() {
           <AuthPanel onAuthChange={setAuthState} />
         ) : tab === "subtitle" ? (
           <SubtitleView />
+        ) : tab === "game" ? (
+          <GameView />
         ) : tab === "search" ? (
           <SearchView allWords={allWords} />
         ) : level.id >= 3 && !isPaid ? (
