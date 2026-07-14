@@ -150,3 +150,5 @@ function parseVTT(vtt) {
   // Phụ đề tự động của YouTube hay lặp lại dòng giống hệt dòng trước — lọc bớt cho gọn
   return cues.filter((c, idx) => idx === 0 || c.text !== cues[idx - 1].text);
 }
+
+
